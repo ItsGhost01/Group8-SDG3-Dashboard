@@ -80,8 +80,8 @@ Follow these steps carefully if setting up on a new machine.
 Open **Command Prompt** or **PowerShell** and run:
 
 ```bash
-git clone https://github.com/YourUsername/ITS68404-Group8-SDG3-Dashboard.git
-cd ITS68404-Group8-SDG3-Dashboard
+git clone https://github.com/ItsGhost01/Group8-SDG3-Dashboard.git
+cd Group8-SDG3-Dashboard
 ```
 
 ---
