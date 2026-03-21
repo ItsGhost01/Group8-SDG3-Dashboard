@@ -1,19 +1,7 @@
 """
 ITS68404 – Data Visualization | Group 8
 SDG 3: Good Health and Well-Being
-Streamlit Dashboard — Professional Redesign
-
-Design Principles Applied:
-  1. Data-Ink Ratio     — Remove all non-data ink (gridlines, borders, backgrounds)
-  2. Gestalt Principles — Proximity, similarity, continuity, figure-ground
-  3. Pre-attentive Attr — Color, size, position to guide attention immediately
-  4. Tufte Principles   — No chartjunk, small multiples, sparklines, clear labels
-  5. Few's Rules        — Right chart for right question, no 3D pie/donut abuse
-  6. Stakeholder Focus  — Every visual answers a real decision question
-  7. Visual Hierarchy   — Most important info largest + top-left
-  8. Color              — Max 6 categorical colors, semantic (red=bad, green=good)
-  9. Consistency        — Same color = same meaning throughout
- 10. Accessibility      — Sufficient contrast ratios, no color-only encoding
+Streamlit Dashboard
 """
 
 import os, warnings
