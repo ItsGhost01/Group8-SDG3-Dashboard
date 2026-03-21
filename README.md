@@ -48,8 +48,8 @@ This project addresses the research question:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YourUsername/ITS68404-Group8-SDG3-Dashboard.git
-cd ITS68404-Group8-SDG3-Dashboard
+git clone https://github.com/ItsGhost01/Group8-SDG3-Dashboard.git
+cd Group8-SDG3-Dashboard
 
 # 2. Install dependencies
 pip install -r requirements.txt
@@ -125,9 +125,9 @@ pip install streamlit plotly pandas numpy scikit-learn scipy
 Make sure all these files are present:
 
 ```
-📁 ITS68404-Group8-SDG3-Dashboard/
+📁 Group8-SDG3-Dashboard/
   ├── dashboard.py                          ← Streamlit app
-  ├── ITS68404_Group8_GROUPASGNMT_FINAL.ipynb  ← Jupyter notebook
+  ├── ITS68404_Group8_GROUPASGNMT.ipynb  ← Jupyter notebook
   ├── gapminder_data_graphs.csv             ← Dataset 1
   ├── Life_Expectancy_Data.csv              ← Dataset 2
   ├── requirements.txt                      ← Dependencies
@@ -180,7 +180,7 @@ Or open it directly in **VS Code** with the Jupyter extension installed.
 ## 📁 Project Structure
 
 ```
-ITS68404-Group8-SDG3-Dashboard/
+Group8-SDG3-Dashboard/
 │
 ├── dashboard.py                          # Main Streamlit dashboard
 │   ├── Tab 1: Overview & EDA             # 6+ chart types, distributions, correlations
@@ -191,7 +191,7 @@ ITS68404-Group8-SDG3-Dashboard/
 │   ├── Tab 6: Ethical Bias               # Missing data heatmap + bias visualization
 │   └── Tab 7: Uncertainty                # 95% CI ribbons + uncertainty comparison
 │
-├── ITS68404_Group8_GROUPASGNMT_FINAL.ipynb
+├── ITS68404_Group8_GROUPASGNMT.ipynb
 │   ├── Task 1: Problem Identification    # Stakeholders, SDG alignment
 │   ├── Task 2: Data Engineering          # Loading, cleaning, outlier detection, features
 │   ├── Task 3: EDA (6 viz types)         # Histograms, heatmap, Preston curve, violin, etc.
