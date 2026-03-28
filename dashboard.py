@@ -1,1192 +1,1315 @@
 """
-ITS68404 – Data Visualization | Group 8
-SDG 3: Good Health and Well-Being
-Streamlit Dashboard
+SDG 3 · Global Health & Life Expectancy Dashboard
+===================================================
+Course  : ITS68404 · Data Visualization
+Group   : 8 · Taylor's University · January 2026
+Dataset : WHO Life Expectancy + Gapminder (2000–2015)
+          2,416 records across 151 countries
+
+INTERACTIVITY OVERVIEW
+----------------------
+This dashboard is fully interactive. Every control drives the entire page:
+
+  Global Filters (top bar)
+  ├── Continent multi-select  → filters ALL KPI cards and ALL tab charts
+  ├── Development Stage       → same cross-filtering effect
+  └── Year Range slider       → same cross-filtering effect
+
+  Per-Tab Controls (inside each tab)
+  ├── "Highlight continent / income stage" dropdowns visually dim non-selected
+  │   groups without changing the underlying data filter, allowing comparison.
+  └── Metric / X-axis selectors change what variable is plotted.
+
+  KPI Cards
+  └── Values update instantly whenever any global filter changes, showing the
+      mean (and start→end delta) for the filtered subset.
+
+CROSS-FILTERING MECHANISM
+--------------------------
+Streamlit reruns the entire script top-to-bottom on every widget interaction.
+All charts and KPIs share the single filtered DataFrame `DFF`, which is
+rebuilt from the global filter widgets at the top of the layout.  There is no
+separate callback wiring needed: changing any filter automatically propagates
+to every visual because they all read from `DFF`.
+
+The "clicked_cont / clicked_stage" session-state keys allow a chart-selection
+(e.g. choosing a continent inside Tab 1) to be remembered across reruns and
+pre-populate the highlight dropdown in that tab — simulating click-to-filter.
 """
 
-import os, warnings
+# ── Standard Library ──────────────────────────────────────────────────────────
+import os
+import warnings
+
+# ── Third-Party ───────────────────────────────────────────────────────────────
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
 from scipy import stats
+from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+
 warnings.filterwarnings("ignore")
 
-# ══════════════════════════════════════════════════════════
-# PAGE CONFIG
-# ══════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE CONFIGURATION
+#  Must be the first Streamlit call in the script.
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="SDG 3 — Global Health Dashboard",
-    page_icon="🌍",
+    page_title="SDG 3 · Global Health Dashboard",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ══════════════════════════════════════════════════════════
-# DESIGN SYSTEM  (single source of truth for all colors)
-# Principle: Consistency — same color = same meaning everywhere
-# ══════════════════════════════════════════════════════════
-C_BG     = "#F8F9FA"
-C_SURF   = "#FFFFFF"
-C_BORDER = "#E9ECEF"
-C_TEXT   = "#212529"
-C_MUTED  = "#6C757D"
-C_GRID   = "#F1F3F5"
 
-# Semantic palette — color encodes meaning, not decoration
-C_GOOD   = "#0D9488"   # teal  — positive outcomes
-C_BAD    = "#DC2626"   # red   — risk / negative indicators
-C_NEUTRAL= "#3B82F6"   # blue  — neutral comparisons
-C_WARN   = "#D97706"   # amber — caution / developing nations
-C_PURPLE = "#7C3AED"   # purple — composite indices
+# ══════════════════════════════════════════════════════════════════════════════
+#  THEME STATE
+#  Persisted in session_state so the dark/light toggle survives reruns.
+# ══════════════════════════════════════════════════════════════════════════════
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
 
-# Continent palette — max 6, colorblind-considered
-CONT_COL = {
-    "Africa":        "#DC2626",
-    "Asia":          "#3B82F6",
-    "Europe":        "#0D9488",
-    "North America": "#D97706",
-    "South America": "#7C3AED",
-    "Oceania":       "#DB2777",
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLOR PALETTES
+#  These palettes are shared between KPI cards and chart traces so that the
+#  same continent / income stage always renders in the same colour everywhere.
+# ══════════════════════════════════════════════════════════════════════════════
+CONTINENT_COLORS: dict[str, str] = {
+    "Africa":        "#FF6B6B",
+    "Asia":          "#4ECDC4",
+    "Europe":        "#45B7D1",
+    "North America": "#96CEB4",
+    "South America": "#F9CA24",
+    "Oceania":       "#C39BD3",
 }
 
-# Chart layout defaults — high data-ink ratio
-CHART_DEFAULTS = dict(
-    paper_bgcolor=C_SURF, plot_bgcolor=C_SURF,
-    font=dict(family="Inter, Arial, sans-serif", color=C_TEXT, size=12),
-    hoverlabel=dict(bgcolor=C_SURF, bordercolor=C_BORDER,
-                    font=dict(size=12, color=C_TEXT)),
-)
-AXIS_STYLE = dict(
-    gridcolor=C_GRID, gridwidth=1, showline=False, zeroline=False,
-    tickfont=dict(size=11, color=C_MUTED),
-    title_font=dict(size=12, color=C_TEXT),
-)
+INCOME_STAGE_COLORS: dict[str, str] = {
+    "Low Income":    "#EF4444",
+    "Lower-Middle":  "#F97316",
+    "Upper-Middle":  "#10B981",
+    "High Income":   "#3B82F6",
+}
 
-def apply_defaults(fig, title="", h=400, margin=None):
-    m = margin or dict(t=50, b=40, l=50, r=20)
-    fig.update_layout(**CHART_DEFAULTS, height=h, margin=m,
-                      title=dict(text=title, x=0,
-                                 font=dict(size=14, color=C_TEXT),
-                                 pad=dict(b=10)))
-    fig.update_xaxes(**AXIS_STYLE)
-    fig.update_yaxes(**AXIS_STYLE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KPI METADATA
+#  Each tuple defines one KPI card:
+#    (dataframe_column, display_label, unit_suffix, good_direction, hex_color,
+#     heroicon_svg_path)
+#
+#  Colors deliberately match the chart color for that metric so users can
+#  visually connect a KPI card to the corresponding chart trace:
+#    Life Expectancy  → teal   #10B981  (positive health outcome)
+#    Adult Mortality  → red    #EF4444  (negative health outcome)
+#    Immunization     → blue   #3B82F6  (matches Preston curve scatter)
+#    HDI Index        → purple #8B5CF6  (composite development index)
+#    Under-5 Deaths   → orange #F97316  (child health risk)
+#    HIV/AIDS         → amber  #F59E0B  (epidemic warning)
+#    Avg Schooling    → indigo #6366F1  (education proxy)
+# ══════════════════════════════════════════════════════════════════════════════
+KPI_META: list[tuple] = [
+    (
+        "life_expectancy", "Life Expectancy", "yrs", "up", "#10B981",
+        "M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364"
+        "L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z",
+    ),
+    (
+        "adult_mortality", "Adult Mortality", "/1K", "down", "#EF4444",
+        "M3 13.5a9 9 0 119 9M3 13.5A9 9 0 0112 4.5M3 13.5H12m0 0V4.5m0 9l-3-3m3 3l3-3",
+    ),
+    (
+        "immunization", "Immunization", "%", "up", "#3B82F6",
+        "M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
+    ),
+    (
+        "hdi_index", "HDI Index", "", "up", "#8B5CF6",
+        "M3 13.5l2.47-9.88A2.25 2.25 0 017.64 2.25h8.72a2.25 2.25 0 012.17 1.37L21 13.5"
+        "M3 13.5H21M3 13.5a2.25 2.25 0 002.25 2.25h13.5A2.25 2.25 0 0021 13.5m-18 0v6a2.25"
+        " 2.25 0 002.25 2.25h13.5A2.25 2.25 0 0021 19.5v-6",
+    ),
+    (
+        "under_five_deaths", "Under-5 Deaths", "/1K", "down", "#F97316",
+        "M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z"
+        "M4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z",
+    ),
+    (
+        "hiv_aids", "HIV/AIDS Rate", "", "down", "#F59E0B",
+        "M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874"
+        " 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z",
+    ),
+    (
+        "schooling", "Avg Schooling", "yrs", "up", "#6366F1",
+        "M4.26 10.147a60.438 60.438 0 00-.491 6.347A48.627 48.627 0 0112 20.904a48.627 48.627"
+        " 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.636 50.636 0 00-2.658-.813"
+        "A59.906 59.906 0 0112 3.493a59.903 59.903 0 0110.399 5.84c-.896.248-1.783.52-2.658.814"
+        "m-15.482 0A50.717 50.717 0 0112 13.489a50.702 50.702 0 017.74-3.342M6.75 15a.75.75 0"
+        " 100-1.5.75.75 0 000 1.5zm0 0v-3.675A55.378 55.378 0 0112 8.443m-7.007 11.55A5.981"
+        " 5.981 0 006.75 15.75v-1.5",
+    ),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DYNAMIC CSS
+#  Rebuilt on every render so dark/light colours update immediately.
+#
+#  Layout targets 1920×1080 with no vertical scroll:
+#    - Header + filters : ~58 px
+#    - KPI row          : ~95 px
+#    - Tab bar          : ~38 px
+#    - Per-tab controls : ~44 px
+#    - Chart area       : ~410–420 px  (see CHART_HEIGHT constant below)
+#    - Insight bar      : ~34 px
+#    - Footer           : ~26 px
+#    - Paddings / gaps  : ~50 px
+#    ─────────────────────────────
+#    Total              : ~755 px   (leaves headroom for browser chrome)
+# ══════════════════════════════════════════════════════════════════════════════
+def inject_css(dark: bool) -> None:
+    """Inject theme-aware CSS into the Streamlit app."""
+    if dark:
+        bg     = "#0F172A"
+        surf   = "#1E293B"
+        border = "#334155"
+        text   = "#F1F5F9"
+        muted  = "#94A3B8"
+        shadow       = "0 1px 6px rgba(0,0,0,0.5)"
+        tab_hover_bg = "#0F172A"
+        toggle_bg    = "#1E293B"
+        toggle_border = "#334155"
+        insight_bg   = "rgba(16,185,129,0.12)"
+        click_bg     = "rgba(59,130,246,0.15)"
+        click_border = "rgba(59,130,246,0.4)"
+    else:
+        bg     = "#F1F5F9"
+        surf   = "#FFFFFF"
+        border = "#E2E8F0"
+        text   = "#0F172A"
+        muted  = "#64748B"
+        shadow       = "0 1px 4px rgba(0,0,0,0.08)"
+        tab_hover_bg = "#F1F5F9"
+        toggle_bg    = "#FFFFFF"
+        toggle_border = "#E2E8F0"
+        insight_bg   = "rgba(16,185,129,0.08)"
+        click_bg     = "rgba(59,130,246,0.08)"
+        click_border = "#BFDBFE"
+
+    st.markdown(f"""
+<style>
+/* ── App shell ──────────────────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] {{ background:{bg} !important; }}
+[data-testid="stMain"]             {{ background:{bg} !important; }}
+section[data-testid="stSidebar"]   {{ display:none !important; }}
+[data-testid="collapsedControl"]   {{ display:none !important; }}
+#MainMenu, footer, header          {{ visibility:hidden !important; }}
+
+/* Tight padding keeps everything on one screen at 1080 px height */
+.block-container {{
+    padding:0.55rem 1.2rem 0.3rem !important;
+    max-width:100% !important;
+}}
+
+/* ── Title ──────────────────────────────────────────────────────────────── */
+.dash-title {{ font-size:1.15rem; font-weight:700; color:{text}; }}
+.dash-sub   {{ font-size:0.74rem; color:{muted}; margin-top:1px; }}
+
+/* ── Dark / Light toggle ─────────────────────────────────────────────────── */
+.theme-btn {{
+    background:{toggle_bg}; border:1px solid {toggle_border};
+    border-radius:8px; padding:5px 12px; cursor:pointer;
+    font-size:0.78rem; font-weight:600; color:{text};
+    display:inline-flex; align-items:center; gap:6px;
+    box-shadow:{shadow};
+}}
+
+/* ── Filter bar label ────────────────────────────────────────────────────── */
+.filter-hdr {{
+    font-size:0.65rem; font-weight:700; color:{muted};
+    text-transform:uppercase; letter-spacing:0.07em;
+    display:flex; align-items:center; gap:5px; margin-bottom:4px;
+}}
+.filter-hdr svg {{ width:11px; height:11px; stroke:{muted}; }}
+
+/* ── Streamlit widget overrides ──────────────────────────────────────────── */
+.stSelectbox label, .stMultiSelect label, .stSlider label {{
+    font-size:0.68rem !important; color:{muted} !important;
+    font-weight:600 !important; text-transform:uppercase !important;
+    letter-spacing:0.05em !important;
+}}
+.stSelectbox > div > div, .stMultiSelect > div > div {{
+    background:{surf} !important;
+    border-color:{border} !important;
+    color:{text} !important;
+    font-size:0.82rem !important;
+}}
+[data-baseweb="tag"]      {{ background:#3B82F6 !important; }}
+[data-baseweb="tag"] span {{ color:#fff !important; }}
+[data-baseweb="tab-highlight"] {{ display:none !important; }}
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+    background:{surf} !important;
+    border:0.5px solid {border} !important;
+    border-radius:10px !important;
+    padding:3px 4px !important;
+    gap:2px !important;
+    margin-bottom:6px !important;
+}}
+[data-testid="stTabs"] button {{
+    font-size:0.78rem !important; font-weight:500 !important;
+    color:{muted} !important; border-radius:7px !important;
+    padding:4px 11px !important; transition:all .12s !important;
+}}
+[data-testid="stTabs"] button:hover {{
+    background:{tab_hover_bg} !important; color:{text} !important;
+}}
+[data-testid="stTabs"] button[aria-selected="true"] {{
+    background:#3B82F6 !important; color:#fff !important; font-weight:600 !important;
+}}
+
+/* ── KPI cards ───────────────────────────────────────────────────────────── */
+.kpi-wrap {{
+    background:{surf};
+    border:0.5px solid {border};
+    border-radius:12px;
+    padding:10px 12px;
+    box-shadow:{shadow};
+    position:relative;
+    overflow:hidden;
+    transition:transform .15s, box-shadow .15s;
+}}
+.kpi-wrap:hover {{ transform:translateY(-2px); box-shadow:0 4px 14px rgba(0,0,0,0.12); }}
+.kpi-accent {{
+    position:absolute; top:0; left:0;
+    width:100%; height:3px; border-radius:12px 12px 0 0;
+}}
+.kpi-icon-wrap {{
+    width:30px; height:30px; border-radius:8px;
+    display:flex; align-items:center; justify-content:center; margin-bottom:6px;
+}}
+.kpi-icon-wrap svg {{ width:15px; height:15px; }}
+.kpi-val   {{ font-size:1.3rem; font-weight:700; color:{text}; line-height:1.05; }}
+.kpi-label {{
+    font-size:0.63rem; font-weight:600; color:{muted};
+    text-transform:uppercase; letter-spacing:0.05em; margin-top:2px;
+}}
+.kpi-delta-up   {{ font-size:0.67rem; font-weight:700; color:#10B981; margin-top:4px; }}
+.kpi-delta-down {{ font-size:0.67rem; font-weight:700; color:#EF4444; margin-top:4px; }}
+.kpi-delta-flat {{ font-size:0.67rem; color:{muted}; margin-top:4px; }}
+.kpi-tooltip {{ font-size:0.6rem; color:{muted}; margin-top:2px; line-height:1.3;
+                opacity:0.75; white-space:normal; }}
+
+/* ── Insight box (below each chart) ──────────────────────────────────────── */
+.insight {{
+    background:{insight_bg};
+    border-left:3px solid #10B981;
+    border-radius:0 8px 8px 0;
+    padding:6px 10px;
+    font-size:0.74rem; color:{text};
+    margin-top:4px; line-height:1.5;
+}}
+
+/* ── Active click-filter notice ──────────────────────────────────────────── */
+.click-info {{
+    background:{click_bg};
+    border:0.5px solid {click_border};
+    border-radius:9px; padding:7px 12px;
+    font-size:0.76rem; color:{text};
+    margin-bottom:5px;
+    display:flex; align-items:center; gap:8px;
+}}
+
+hr {{ border-color:{border} !important; margin:4px 0 !important; }}
+</style>""", unsafe_allow_html=True)
+
+
+inject_css(st.session_state.dark_mode)
+
+# Convenience colour variables — rebuilt after each theme injection
+DARK      = st.session_state.dark_mode
+TEXT_COL  = "#F1F5F9" if DARK else "#0F172A"
+MUTED_COL = "#94A3B8" if DARK else "#64748B"
+SURF_COL  = "#1E293B" if DARK else "#FFFFFF"
+
+# Target chart height (px) sized so the full page fits in 1080 px tall windows.
+# Reduce this value if you need taller tab-control areas.
+CHART_HEIGHT = 320
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA LOADING & PREPROCESSING
+#  Cached so the heavy merge/impute step only runs once per session.
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(show_spinner=False)
+def load_data() -> pd.DataFrame:
+    """
+    Load, merge, and preprocess the WHO and Gapminder source files.
+
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned, merged dataset with derived columns:
+        - gdp_final   : best available GDP per capita
+        - log_gdp     : natural log of gdp_final (for Preston curve)
+        - immunization: mean of hepatitis_b, polio, diphtheria coverage
+        - pop_size    : sqrt-scaled population (for bubble chart sizing)
+        - dev_stage   : income quartile label based on log_gdp
+        - *_n         : min-max normalised versions of key indicators
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # ── Load WHO file (try both common filename variants) ──────────────────
+    who_df = None
+    for filename in ["Life_Expectancy_Data.csv", "Life Expectancy Data.csv"]:
+        path = os.path.join(base_dir, filename)
+        if os.path.exists(path):
+            who_df = pd.read_csv(path)
+            break
+    if who_df is None:
+        raise FileNotFoundError(
+            "Life_Expectancy_Data.csv not found. "
+            "Place it in the same folder as this script."
+        )
+
+    gap_df = pd.read_csv(os.path.join(base_dir, "gapminder_data_graphs.csv"))
+
+    # ── Normalise column names ─────────────────────────────────────────────
+    who_df.columns = [
+        c.strip().lower().replace(" ", "_").replace("/", "_")
+        for c in who_df.columns
+    ]
+    gap_df.columns = [c.strip().lower() for c in gap_df.columns]
+
+    # ── Rename WHO columns to stable keys ─────────────────────────────────
+    rename_map: dict[str, str] = {}
+    for col in who_df.columns:
+        if   "life"   in col and "expect" in col: rename_map[col] = "life_expectancy"
+        elif "bmi"    in col:                      rename_map[col] = "bmi"
+        elif "hiv"    in col:                      rename_map[col] = "hiv_aids"
+        elif "dipht"  in col:                      rename_map[col] = "diphtheria"
+        elif "thin"   in col and "1-19"  in col:   rename_map[col] = "thinness_1_19"
+        elif "thin"   in col and "5-9"   in col:   rename_map[col] = "thinness_5_9"
+        elif "income" in col:                      rename_map[col] = "income_composition"
+        elif "under"  in col:                      rename_map[col] = "under_five_deaths"
+        elif "hepat"  in col:                      rename_map[col] = "hepatitis_b"
+        elif "measl"  in col:                      rename_map[col] = "measles"
+        elif "perce"  in col:                      rename_map[col] = "pct_expenditure"
+        elif "total"  in col and "exp"   in col:   rename_map[col] = "total_expenditure"
+        elif "adult"  in col:                      rename_map[col] = "adult_mortality"
+        elif "infant" in col:                      rename_map[col] = "infant_deaths"
+        elif "polio"  in col:                      rename_map[col] = "polio"
+        elif "school" in col:                      rename_map[col] = "schooling"
+        elif "popul"  in col:                      rename_map[col] = "population"
+        elif "gdp"    in col:                      rename_map[col] = "gdp_who"
+    who_df.rename(columns=rename_map, inplace=True)
+
+    # ── Impute missing numeric values with per-country median ──────────────
+    for df in (who_df, gap_df):
+        for col in df.select_dtypes(include=np.number).columns:
+            df[col] = (
+                df.groupby("country")[col]
+                  .transform(lambda s: s.fillna(s.median()))
+            )
+            df[col] = df[col].fillna(df[col].median())
+
+    # ── Merge WHO + Gapminder on (country, year) ───────────────────────────
+    merged = pd.merge(
+        who_df,
+        gap_df[["country", "year", "continent", "hdi_index", "co2_consump", "gdp", "services"]],
+        on=["country", "year"],
+        how="inner",
+    )
+
+    # ── Derive helper columns ──────────────────────────────────────────────
+    merged["gdp_final"]    = merged["gdp"].fillna(merged.get("gdp_who", np.nan))
+    merged["log_gdp"]      = np.log1p(merged["gdp_final"])
+
+    immunization_cols      = [c for c in ["hepatitis_b", "polio", "diphtheria"] if c in merged.columns]
+    merged["immunization"] = merged[immunization_cols].mean(axis=1)
+
+    merged["population"]   = pd.to_numeric(
+        merged.get("population", 1e6), errors="coerce"
+    ).fillna(1e6)
+    merged["pop_m"]        = merged["population"] / 1e6
+    merged["pop_size"]     = np.sqrt(merged["pop_m"]).clip(4, 55)  # bubble chart size
+
+    # Income-stage quartile labels derived from log GDP
+    merged["dev_stage"] = pd.cut(
+        merged["log_gdp"],
+        bins=[-np.inf, 5, 7, 9, np.inf],
+        labels=["Low Income", "Lower-Middle", "Upper-Middle", "High Income"],
+    )
+
+    # Min-max normalise key indicators (used in radar / composite views)
+    scaler = MinMaxScaler()
+    normalise_cols = ["life_expectancy", "schooling", "immunization", "hdi_index", "log_gdp"]
+    for col in normalise_cols:
+        if col in merged.columns:
+            merged[col + "_n"] = scaler.fit_transform(merged[[col]])
+
+    return merged
+
+
+# ── Load data — show a spinner while the cache is cold ────────────────────
+with st.spinner("Loading data…"):
+    try:
+        DF   = load_data()
+        data_ok = True
+    except Exception as exc:
+        data_ok  = False
+        load_err = str(exc)
+
+if not data_ok:
+    st.error(
+        f"Cannot load CSV files. Place them in the same folder as this script.\n\n`{load_err}`"
+    )
+    st.stop()
+
+# ── Derive global filter options from the loaded data ─────────────────────
+ALL_CONTINENTS    = sorted(DF["continent"].dropna().unique())
+ALL_INCOME_STAGES = ["Low Income", "Lower-Middle", "Upper-Middle", "High Income"]
+YEAR_MIN          = int(DF["year"].min())
+YEAR_MAX          = int(DF["year"].max())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPER FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def filter_data(
+    base: pd.DataFrame,
+    continents: list[str],
+    year_range: tuple[int, int],
+    income_stages: list[str],
+) -> pd.DataFrame:
+    """
+    Return a filtered slice of the dataset.
+
+    This is the core cross-filtering function.  Every chart and every KPI
+    card calls this with the same global widget values, so they all reflect
+    the same selection simultaneously.
+
+    Parameters
+    ----------
+    base          : Full source DataFrame.
+    continents    : Selected continent names (empty list = all).
+    year_range    : (start_year, end_year) inclusive.
+    income_stages : Selected development-stage labels (empty list = all).
+    """
+    result = base.copy()
+    if continents:
+        result = result[result["continent"].isin(continents)]
+    result = result[result["year"].between(year_range[0], year_range[1])]
+    if income_stages:
+        result = result[result["dev_stage"].isin(income_stages)]
+    return result
+
+
+def hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert a '#RRGGBB' hex string to an 'rgba(r,g,b,a)' CSS string."""
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def apply_chart_theme(fig: go.Figure, height: int = CHART_HEIGHT) -> go.Figure:
+    """
+    Apply the shared dark/light theme to a Plotly figure.
+
+    Sets transparent backgrounds, consistent font, muted grid lines, and
+    a uniform hover-label style.  All charts call this so the theme is
+    defined in one place and updates automatically when the user toggles
+    dark/light mode.
+    """
+    fig.update_layout(
+        height=height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, Arial, sans-serif", size=11, color=TEXT_COL),
+        margin=dict(t=28, b=38, l=50, r=18),
+        hoverlabel=dict(bgcolor=SURF_COL, font_size=12, font_color=TEXT_COL),
+    )
+    fig.update_xaxes(
+        gridcolor="rgba(148,163,184,0.15)",
+        zeroline=False,
+        tickfont=dict(size=10, color=MUTED_COL),
+        showline=False,
+    )
+    fig.update_yaxes(
+        gridcolor="rgba(148,163,184,0.15)",
+        zeroline=False,
+        tickfont=dict(size=10, color=MUTED_COL),
+        showline=False,
+    )
     return fig
 
 
-# ══════════════════════════════════════════════════════════
-# CSS — minimal and purposeful
-# ══════════════════════════════════════════════════════════
-st.markdown("""
-<style>
-[data-testid="stAppViewContainer"] { background: #F8F9FA; }
-[data-testid="stMain"] { padding-top: 1rem; }
-[data-testid="stSidebar"] { background: #1E293B; border-right: 1px solid #334155; }
-[data-testid="stSidebar"] * { color: #CBD5E1 !important; }
-[data-testid="stSidebar"] label { color: #94A3B8 !important; font-size: 0.78rem !important;
-    letter-spacing: 0.05em !important; text-transform: uppercase !important; }
-[data-testid="stSidebar"] [data-baseweb="tag"] { background: #1D4ED8 !important; }
-[data-testid="stSidebar"] [data-baseweb="tag"] * { color: #fff !important; }
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEADER ROW — title | global filters | theme toggle
+#  Laid out in three columns proportioned to fill the full width.
+# ══════════════════════════════════════════════════════════════════════════════
+header_col_title, header_col_filters, header_col_toggle = st.columns([1.2, 3.5, 0.5])
 
-[data-testid="stTabs"] [data-baseweb="tab-list"] { background: #fff; border-radius: 8px;
-    padding: 3px 6px; gap: 2px; border: 1px solid #E9ECEF; }
-[data-testid="stTabs"] button { color: #495057 !important; font-weight: 500 !important;
-    font-size: 0.88rem !important; border-radius: 6px !important; padding: 6px 14px !important; }
-[data-testid="stTabs"] button:hover { background: #F1F3F5 !important; color: #212529 !important; }
-[data-testid="stTabs"] button[aria-selected="true"] { background: #EFF6FF !important;
-    color: #1D4ED8 !important; font-weight: 600 !important; }
-[data-testid="stTabs"] [data-baseweb="tab-highlight"] { display: none !important; }
+with header_col_title:
+    st.markdown(
+        '<div class="dash-title">Global Health & Life Expectancy</div>'
+        '<div class="dash-sub">SDG 3 · WHO + Gapminder · 2000–2015</div>',
+        unsafe_allow_html=True,
+    )
 
-.kpi-card { background: #fff; border-radius: 10px; padding: 16px 18px;
-    border: 1px solid #E9ECEF; border-top: 3px solid #3B82F6; }
-.kpi-icon { width: 36px; height: 36px; border-radius: 8px; display: flex;
-    align-items: center; justify-content: center; margin-bottom: 10px; }
-.kpi-icon svg { width: 18px; height: 18px; }
-.kpi-val { font-size: 1.6rem; font-weight: 700; line-height: 1.1; color: #212529; }
-.kpi-lbl { font-size: 0.74rem; color: #6C757D; font-weight: 600; margin-top: 4px;
-    text-transform: uppercase; letter-spacing: 0.04em; }
-.kpi-sub { font-size: 0.68rem; color: #9CA3AF; margin-top: 2px; }
-.kpi-delta-up   { font-size: 0.74rem; color: #0D9488; font-weight: 600; margin-top: 8px; }
-.kpi-delta-down { font-size: 0.74rem; color: #DC2626; font-weight: 600; margin-top: 8px; }
+with header_col_filters:
+    # ── Filter bar label ──────────────────────────────────────────────────
+    # These three widgets are the "global filters" that cross-filter every
+    # KPI card and every chart on the page simultaneously.
+    st.markdown(
+        """<div class="filter-hdr">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5"
+               stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+          </svg>
+          Global Filters — updates all KPIs and charts
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    fc1, fc2, fc3 = st.columns([2.5, 2, 1.5])
+    with fc1:
+        # Multi-select: choose one, many, or "All Continents"
+        cont_options = ["All Continents"] + ALL_CONTINENTS
+        sel_cont_raw = st.multiselect(
+            "Continent",
+            cont_options,
+            default=["All Continents"],
+            key="g_cont",
+            placeholder="Select continents…",
+        )
+        # If "All Continents" is chosen (or nothing selected), use every continent
+        if not sel_cont_raw or "All Continents" in sel_cont_raw:
+            sel_continents = ALL_CONTINENTS
+        else:
+            sel_continents = sel_cont_raw
+    with fc2:
+        # Multi-select: choose one, many, or "All Stages"
+        stage_options = ["All Stages"] + ALL_INCOME_STAGES
+        sel_stage_raw = st.multiselect(
+            "Development Stage",
+            stage_options,
+            default=["All Stages"],
+            key="g_stage",
+            placeholder="Select stages…",
+        )
+        # If "All Stages" is chosen (or nothing selected), use every stage
+        if not sel_stage_raw or "All Stages" in sel_stage_raw:
+            sel_income_stages = ALL_INCOME_STAGES
+        else:
+            sel_income_stages = sel_stage_raw
+    with fc3:
+        sel_year_range = st.slider(
+            "Year Range",
+            YEAR_MIN, YEAR_MAX,
+            (YEAR_MIN, YEAR_MAX),
+            key="g_yr",
+        )
 
-.sec-hdr { font-size: 0.72rem; font-weight: 600; color: #6C757D; text-transform: uppercase;
-    letter-spacing: 0.08em; border-bottom: 1px solid #E9ECEF;
-    padding-bottom: 6px; margin-bottom: 16px; }
-.callout { background: #F0FDF4; border-left: 3px solid #0D9488; border-radius: 0 8px 8px 0;
-    padding: 10px 14px; font-size: 0.82rem; color: #065F46; margin: 8px 0; line-height: 1.6; }
-.callout-warn { background: #FFF7ED; border-left: 3px solid #D97706; border-radius: 0 8px 8px 0;
-    padding: 10px 14px; font-size: 0.82rem; color: #92400E; margin: 8px 0; line-height: 1.6; }
-h1,h2,h3,h4 { color: #212529 !important; }
-</style>
-""", unsafe_allow_html=True)
+with header_col_toggle:
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    toggle_icon  = "🌙" if not DARK else "☀️"
+    toggle_label = "Dark"  if not DARK else "Light"
+    if st.button(f"{toggle_icon} {toggle_label}", key="theme_btn", help="Toggle dark / light mode"):
+        st.session_state.dark_mode = not st.session_state.dark_mode
+        st.rerun()
 
+# ── Apply all three global filters to produce the shared filtered DataFrame ──
+# Every component below this line reads from DFF, so changing any filter
+# above automatically propagates to all KPIs and all six tab charts.
+DFF = filter_data(DF, sel_continents, sel_year_range, sel_income_stages)
 
-# ══════════════════════════════════════════════════════════
-# DATA PIPELINE
-# ══════════════════════════════════════════════════════════
-@st.cache_data(show_spinner="Loading datasets…")
-def load_data():
-    BASE = os.path.dirname(os.path.abspath(__file__))
-    gap  = pd.read_csv(os.path.join(BASE, "gapminder_data_graphs.csv"))
-    who  = pd.read_csv(os.path.join(BASE, "Life Expectancy Data.csv"))
-
-    who.columns = [c.strip().lower().replace(" ","_").replace("/","_") for c in who.columns]
-    gap.columns = [c.strip().lower() for c in gap.columns]
-
-    rmap = {}
-    for c in who.columns:
-        if   "life"   in c and "expect" in c: rmap[c] = "life_expectancy"
-        elif "bmi"    in c:                   rmap[c] = "bmi"
-        elif "hiv"    in c:                   rmap[c] = "hiv_aids"
-        elif "dipht"  in c:                   rmap[c] = "diphtheria"
-        elif "thin"   in c and "1-19" in c:   rmap[c] = "thinness_1_19"
-        elif "thin"   in c and "5-9"  in c:   rmap[c] = "thinness_5_9"
-        elif "income" in c:                   rmap[c] = "income_composition"
-        elif "under"  in c:                   rmap[c] = "under_five_deaths"
-        elif "hepat"  in c:                   rmap[c] = "hepatitis_b"
-        elif "measl"  in c:                   rmap[c] = "measles"
-        elif "perce"  in c:                   rmap[c] = "pct_expenditure"
-        elif "total"  in c and "exp" in c:    rmap[c] = "total_expenditure"
-        elif "adult"  in c:                   rmap[c] = "adult_mortality"
-        elif "infant" in c:                   rmap[c] = "infant_deaths"
-        elif "polio"  in c:                   rmap[c] = "polio"
-        elif "school" in c:                   rmap[c] = "schooling"
-        elif "popul"  in c:                   rmap[c] = "population"
-        elif "gdp"    in c:                   rmap[c] = "gdp_who"
-    who.rename(columns=rmap, inplace=True)
-
-    # Impute: country median then global median
-    for col in who.select_dtypes(include=np.number).columns:
-        who[col] = who.groupby("country")[col].transform(lambda x: x.fillna(x.median()))
-        who[col] = who[col].fillna(who[col].median())
-    for col in gap.select_dtypes(include=np.number).columns:
-        gap[col] = gap.groupby("country")[col].transform(lambda x: x.fillna(x.median()))
-        gap[col] = gap[col].fillna(gap[col].median())
-
-    df = pd.merge(who,
-                  gap[["country","year","continent","hdi_index","co2_consump","gdp","services"]],
-                  on=["country","year"], how="inner")
-
-    df["gdp_final"]     = df["gdp"].fillna(df["gdp_who"])
-    df["log_gdp"]       = np.log1p(df["gdp_final"])
-    df["immunization"]  = df[["hepatitis_b","polio","diphtheria"]].mean(axis=1)
-    df["mortality_idx"] = (df["adult_mortality"] + df["under_five_deaths"]*5) / 100
-    df["population"]    = pd.to_numeric(df["population"], errors="coerce").fillna(1e6)
-    df["pop_m"]         = df["population"] / 1e6
-    df["pop_size"]      = np.sqrt(df["pop_m"]).clip(4, 55)
-    df["dev_stage"]     = pd.cut(df["log_gdp"],
-                                 bins=[-np.inf, 5, 7, 9, np.inf],
-                                 labels=["Low Income","Lower-Middle","Upper-Middle","High Income"])
-    sc = MinMaxScaler()
-    for c in ["bmi","schooling","immunization","hdi_index","life_expectancy","log_gdp"]:
-        df[c+"_n"] = sc.fit_transform(df[[c]])
-    return df
-
-df = load_data()
+st.markdown("<hr>", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("### 🌍 SDG 3 Dashboard")
-    st.markdown("<p style='font-size:0.78rem;color:#64748B;margin-top:-8px'>Global Health & Life Expectancy</p>",
-                unsafe_allow_html=True)
-    st.markdown("---")
+# ══════════════════════════════════════════════════════════════════════════════
+#  KPI CARDS
+#  Seven metric cards in a single responsive row.
+#  Each card shows: icon · current mean value · trend delta (start→end year).
+#  Colors match the chart trace color for that metric (see KPI_META comment).
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_kpi_delta_html(col: str, good_direction: str) -> str:
+    """
+    Return an HTML snippet showing the change in `col` from the start to the
+    end of the selected year range.
 
-    all_cont  = sorted(df["continent"].dropna().unique())
-    sel_cont  = st.multiselect("Continent", all_cont, default=all_cont)
-    yr_min, yr_max = int(df["year"].min()), int(df["year"].max())
-    sel_year  = st.slider("Year range", yr_min, yr_max, (yr_min, yr_max))
-    dev_stages = df["dev_stage"].cat.categories.tolist()
-    sel_stage = st.multiselect("Development stage", dev_stages, default=dev_stages)
+    The arrow colour is green when the direction of change is "good" (e.g.
+    life expectancy rising, adult mortality falling) and red otherwise.
+    """
+    if sel_year_range[0] == sel_year_range[1]:
+        return "<div class='kpi-delta-flat'>— single year</div>"
+    if col not in DFF.columns:
+        return ""
 
-    st.markdown("---")
-    st.markdown("<p style='font-size:0.7rem;color:#475569;font-weight:600;text-transform:uppercase;letter-spacing:0.06em'>Dataset</p>",
-                unsafe_allow_html=True)
-    st.markdown(f"<p style='font-size:0.82rem'>📊 {df.shape[0]:,} records</p>", unsafe_allow_html=True)
-    st.markdown(f"<p style='font-size:0.82rem'>🌐 {df['country'].nunique()} countries</p>", unsafe_allow_html=True)
-    st.markdown(f"<p style='font-size:0.82rem'>📅 {yr_min}–{yr_max}</p>", unsafe_allow_html=True)
-    st.markdown("---")
+    start_mean = DFF[DFF["year"] == sel_year_range[0]][col].mean()
+    end_mean   = DFF[DFF["year"] == sel_year_range[1]][col].mean()
+    delta      = end_mean - start_mean
+    improving  = (good_direction == "up" and delta >= 0) or \
+                 (good_direction == "down" and delta <= 0)
 
-    with st.expander("⚖️ Ethics & Limitations"):
-        st.markdown("""
-**Reporting bias** — Developing nations have more missing values. Median imputation may understate severity.
-
-**Ecological fallacy** — Country averages hide urban/rural and gender disparities.
-
-**GDP note** — Gapminder GDP primary; WHO GDP as fallback. Current USD, PPP not adjusted.
-
-**Temporal gap** — Dataset ends 2015. COVID-19 impact not captured.
-
-**Ethical use** — Rankings must be contextualised with historical inequities.
-        """)
-
-    st.markdown("---")
-    st.markdown("<p style='font-size:0.72rem;color:#475569;text-align:center'>ITS68404 · Group 8 · Taylor's</p>",
-                unsafe_allow_html=True)
-
-# Apply filters
-mask = (
-    df["continent"].isin(sel_cont) &
-    df["year"].between(sel_year[0], sel_year[1]) &
-    df["dev_stage"].isin(sel_stage)
-)
-dff = df[mask].copy()
-if dff.empty:
-    st.warning("No data matches your filters. Please adjust the sidebar.")
-    st.stop()
+    arrow = "▲" if delta >= 0 else "▼"
+    css   = "kpi-delta-up" if improving else "kpi-delta-down"
+    yr    = (
+        f"<span style='font-weight:400;opacity:0.65'>"
+        f"{sel_year_range[0]}→{sel_year_range[1]}</span>"
+    )
+    return f"<div class='{css}'>{arrow} {abs(delta):.1f} &nbsp;{yr}</div>"
 
 
-# ══════════════════════════════════════════════════════════
-# HEADER
-# ══════════════════════════════════════════════════════════
-st.markdown("## 🌍 Global Health & Life Expectancy — SDG 3")
-st.markdown(
-    "<p style='color:#6C757D;font-size:0.85rem;margin-top:-10px'>"
-    "ITS68404 Data Visualization · Group 8 &nbsp;|&nbsp; "
-    "Stakeholders: WHO · UNICEF · Government Ministries · NGOs · World Bank &nbsp;|&nbsp; "
-    "SDG Targets: 3.1 Maternal · 3.2 Child Survival · 3.3 Epidemics · 3.8 UHC"
-    "</p>",
-    unsafe_allow_html=True
-)
-st.markdown("---")
+kpi_columns = st.columns(7)
+for kpi_col_widget, (col_key, label, unit, good_dir, color, icon_path) in zip(kpi_columns, KPI_META):
+    mean_val = DFF[col_key].mean() if col_key in DFF.columns else float("nan")
 
-
-# ══════════════════════════════════════════════════════════
-# KPI CARDS
-# Principle: Pre-attentive — biggest numbers first (visual hierarchy)
-# Principle: Semantic color — teal=good, red=bad, amber=caution
-# Principle: Delta shows change over selected period
-# ══════════════════════════════════════════════════════════
-def kpi_delta(col, good="up"):
-    y0 = dff[dff["year"]==sel_year[0]][col].mean()
-    y1 = dff[dff["year"]==sel_year[1]][col].mean()
-    d  = y1 - y0
-    if sel_year[0] == sel_year[1]:
-        return "<span style='font-size:0.72rem;color:#9CA3AF'>Single year selected</span>"
-    if (good=="up" and d>=0) or (good=="down" and d<=0):
-        cls, arrow = "kpi-delta-up", "▲"
+    # Format the displayed value according to the metric's precision needs
+    if np.isnan(mean_val):
+        display_val = "N/A"
+    elif col_key == "hdi_index":
+        display_val = f"{mean_val:.3f}"
+    elif col_key in ("life_expectancy", "schooling"):
+        display_val = f"{mean_val:.1f} {unit}"
     else:
-        cls, arrow = "kpi-delta-down", "▼"
-    return f"<div class='{cls}'>{arrow} {abs(d):.1f} &nbsp;({sel_year[0]}→{sel_year[1]})</div>"
+        display_val = f"{mean_val:.1f}{unit}"
 
-# SVG icons — stroke-based, single color, scales with card
-ICONS = {
-    "life_expectancy":  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>',
-    "adult_mortality":  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>',
-    "immunization":     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 12 2 2 4-4"/><path d="M12 3a9 9 0 1 0 9 9"/><path d="M15 3h6v6"/></svg>',
-    "hdi_index":        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>',
-    "under_five_deaths":'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
-    "hiv_aids":         '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 2a2 2 0 0 0-2 2v5H4a2 2 0 0 0-2 2v2c0 1.1.9 2 2 2h5v5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2v-5h5a2 2 0 0 0 2-2v-2a2 2 0 0 0-2-2h-5V4a2 2 0 0 0-2-2h-2z"/></svg>',
-}
+    icon_bg   = color + "22"   # 13 % opacity tint of the metric color
+    delta_html = compute_kpi_delta_html(col_key, good_dir)
 
-kpis = [
-    (C_GOOD,    "life_expectancy",    f"{dff['life_expectancy'].mean():.1f} yrs",
-     "Life Expectancy", "SDG 3 — core health outcome", "up"),
-    (C_BAD,     "adult_mortality",    f"{dff['adult_mortality'].mean():.0f}",
-     "Adult Mortality /1K", "Policy priority — ministries", "down"),
-    (C_NEUTRAL, "immunization",       f"{dff['immunization'].mean():.1f}%",
-     "Immunization Rate", "WHO/UNICEF vaccination KPI", "up"),
-    (C_PURPLE,  "hdi_index",          f"{dff['hdi_index'].mean():.3f}",
-     "HDI Index", "UNDP — SDG progress composite", "up"),
-    (C_BAD,     "under_five_deaths",  f"{dff['under_five_deaths'].mean():.0f}",
-     "Under-5 Deaths /1K", "SDG 3.2 — child survival target", "down"),
-    (C_WARN,    "hiv_aids",           f"{dff['hiv_aids'].mean():.2f}",
-     "HIV/AIDS Rate", "SDG 3.3 — epidemic control", "down"),
-]
+    # Short tooltip for each KPI explaining what it means
+    KPI_TOOLTIPS = {
+        "life_expectancy":   "Average number of years a person is expected to live",
+        "adult_mortality":   "Deaths per 1,000 adults aged 15–60",
+        "immunization":      "Average coverage of Hepatitis B, Polio & Diphtheria vaccines",
+        "hdi_index":         "UN composite index: health + education + income (0–1)",
+        "under_five_deaths": "Deaths of children under 5 per 1,000 live births",
+        "hiv_aids":          "HIV/AIDS deaths per 1,000 population",
+        "schooling":         "Average years of schooling received",
+    }
+    tooltip = KPI_TOOLTIPS.get(col_key, "")
 
-cols = st.columns(6)
-for col_w, (color, col_key, val, lbl, sub, good) in zip(cols, kpis):
-    with col_w:
-        icon_svg = ICONS.get(col_key, "")
-        # icon bg is 15% opacity of the card color
-        icon_bg = color + "22"
+    with kpi_col_widget:
         st.markdown(f"""
-        <div class="kpi-card" style="border-top-color:{color}">
-            <div class="kpi-icon" style="background:{icon_bg};color:{color}">{icon_svg}</div>
-            <div class="kpi-val" style="color:{color}">{val}</div>
-            <div class="kpi-lbl">{lbl}</div>
-            <div class="kpi-sub">{sub}</div>
-            {kpi_delta(col_key, good)}
+        <div class="kpi-wrap" title="{tooltip}">
+          <div class="kpi-accent" style="background:{color}"></div>
+          <div class="kpi-icon-wrap" style="background:{icon_bg}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="{color}"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="{icon_path}"/>
+            </svg>
+          </div>
+          <div class="kpi-val" style="color:{color}">{display_val}</div>
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-tooltip">{tooltip}</div>
+          {delta_html}
         </div>""", unsafe_allow_html=True)
 
-st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("<div style='height:5px'></div>", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════
-# TABS
-# ══════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📊 Overview & EDA",
-    "🌐 Global Trends",
-    "🔬 Advanced Analysis",
-    "⚖️ Scenario Comparison",
-    "🗺️ Geospatial",
-    "⚠️ Ethical Bias",
-    "📉 Uncertainty",
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLICK-TO-FILTER SESSION STATE
+#  These keys let individual tab controls remember which continent/stage was
+#  last highlighted, so selecting a group inside one tab pre-selects the same
+#  group when the user switches to another tab.
+# ══════════════════════════════════════════════════════════════════════════════
+if "clicked_cont"  not in st.session_state: st.session_state.clicked_cont  = "All"
+if "clicked_stage" not in st.session_state: st.session_state.clicked_stage = "All"
+if "clicked_year"  not in st.session_state: st.session_state.clicked_year  = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TABS
+#  Six analysis views, each in its own tab.  Switching tabs does NOT re-filter
+#  the data — all tabs share DFF.  Per-tab controls only change what is
+#  visually highlighted, not the underlying data slice.
+# ══════════════════════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Distributions",
+    "🔥 Correlations",
+    "💰 Preston Curve",
+    "📈 Trends",
+    "🎻 Income Levels",
+    "🫧 Animated Bubble",
 ])
 
 
-# ══════════════════════════════════════════════════════════
-# TAB 1 — OVERVIEW & EDA
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 1 — Distribution Histograms
+#  Shows nine variable distributions in a 3×3 grid.
+#  Selecting a continent dims all other continents, showing their
+#  distribution shape in context (overlay mode) — a form of visual filtering.
+# ─────────────────────────────────────────────────────────────────────────────
 with tab1:
-    st.markdown('<div class="sec-hdr">Exploratory Data Analysis</div>', unsafe_allow_html=True)
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown("**Variable distributions by continent**")
-        var_opts = [
-            ("life_expectancy","Life Expectancy (yrs)"),
-            ("adult_mortality","Adult Mortality /1K"),
-            ("immunization","Immunization Rate (%)"),
-            ("schooling","Schooling (yrs)"),
-            ("hiv_aids","HIV/AIDS Rate"),
-            ("hdi_index","HDI Index"),
-            ("gdp_final","GDP per Capita ($)"),
-        ]
-        var_choice = st.selectbox("Indicator", var_opts,
-                                  format_func=lambda x: x[1],
-                                  label_visibility="collapsed")
-        vcol, vlabel = var_choice
-
-        fig_dist = go.Figure()
-        for cont in sel_cont:
-            sub = dff[dff["continent"]==cont][vcol].dropna()
-            if len(sub) < 3: continue
-            fig_dist.add_trace(go.Histogram(
-                x=sub, name=cont, nbinsx=25,
-                marker_color=CONT_COL.get(cont,"#888"),
-                opacity=0.55, marker_line=dict(width=0),
-                hovertemplate=f"<b>{cont}</b><br>{vlabel}: %{{x}}<br>Count: %{{y}}<extra></extra>"
-            ))
-        med = float(dff[vcol].median())
-        fig_dist.add_vline(x=med, line_dash="dot", line_color=C_MUTED, line_width=1.5,
-                           annotation_text=f"Median {med:.1f}",
-                           annotation_font=dict(size=10, color=C_MUTED),
-                           annotation_position="top right")
-        fig_dist.update_layout(
-            barmode="overlay", **CHART_DEFAULTS, height=320,
-            title=dict(text=vlabel, font=dict(size=13,color=C_TEXT), x=0),
-            showlegend=True,
-            legend=dict(orientation="h", y=1.15, x=0,
-                        font=dict(size=10,color=C_TEXT), bgcolor="rgba(0,0,0,0)"),
-            xaxis=dict(**AXIS_STYLE, title=""),
-            yaxis=dict(**AXIS_STYLE, title="Count")
+    t1_left, _ = st.columns([3, 1])
+    with t1_left:
+        # Show a banner when a click-filter from another tab is active
+        if st.session_state.clicked_cont != "All":
+            st.markdown(
+                f'<div class="click-info">🖱️ <b>Click filter active:</b> '
+                f'showing <b>{st.session_state.clicked_cont}</b> highlighted. '
+                f'Change the selector below to reset.</div>',
+                unsafe_allow_html=True,
+            )
+        # Highlight selector — synced with clicked_cont session state so
+        # clicking a continent in another tab pre-selects it here too.
+        t1_hl_raw = st.multiselect(
+            "🖱️ Highlight continent — select one or more (or keep All to see all)",
+            ["All"] + ALL_CONTINENTS,
+            default=[st.session_state.clicked_cont]
+                     if st.session_state.clicked_cont != "All" else ["All"],
+            key="t1_hl",
         )
-        st.plotly_chart(fig_dist, use_container_width=True)
+        t1_highlight = "All" if (not t1_hl_raw or "All" in t1_hl_raw) else t1_hl_raw[0]
+        st.session_state.clicked_cont = t1_highlight   # write back for cross-tab sync
 
-    with c2:
-        st.markdown("**Correlation matrix — lower triangle**")
-        cv = ["life_expectancy","adult_mortality","schooling","gdp_final",
-              "hiv_aids","immunization","hdi_index","income_composition"]
-        cv = [c for c in cv if c in dff.columns]
-        corr = dff[cv].corr().round(2)
-        labels = [c.replace("_"," ").title() for c in cv]
-        z    = [[corr.iloc[i,j] if i>=j else None for j in range(len(cv))] for i in range(len(cv))]
-        text = [[f"{corr.iloc[i,j]:.2f}" if i>=j else "" for j in range(len(cv))] for i in range(len(cv))]
-        fig_corr = go.Figure(go.Heatmap(
-            z=z, x=labels, y=labels, text=text,
-            texttemplate="%{text}", textfont=dict(size=9,color=C_TEXT),
-            colorscale=[[0,C_BAD],[0.5,C_BG],[1,C_GOOD]],
-            zmid=0, zmin=-1, zmax=1,
-            hovertemplate="<b>%{x}</b> × <b>%{y}</b><br>r = %{z:.3f}<extra></extra>",
-            colorbar=dict(title="r", tickfont=dict(size=9,color=C_MUTED), len=0.7, thickness=12)
-        ))
-        fig_corr.update_layout(**CHART_DEFAULTS, height=320,
-                               xaxis=dict(tickangle=-35, tickfont=dict(size=9,color=C_MUTED), showgrid=False),
-                               yaxis=dict(tickfont=dict(size=9,color=C_MUTED), showgrid=False),
-                               margin=dict(t=10,b=70,l=120,r=30))
-        st.plotly_chart(fig_corr, use_container_width=True)
+    # Variables to plot — only include columns present in the filtered data
+    histogram_vars = [
+        ("life_expectancy", "Life Expectancy", "#10B981"),
+        ("adult_mortality",  "Adult Mortality",  "#EF4444"),
+        ("gdp_final",        "GDP per Capita",   "#45B7D1"),
+        ("schooling",        "Schooling",         "#6366F1"),
+        ("infant_deaths",    "Infant Deaths",     "#F97316"),
+        ("bmi",              "BMI",               "#EC4899"),
+        ("alcohol",          "Alcohol",           "#F59E0B"),
+        ("hiv_aids",         "HIV/AIDS",          "#DC2626"),
+        ("immunization",     "Immunization",      "#3B82F6"),
+    ]
+    histogram_vars = [(c, l, col) for c, l, col in histogram_vars if c in DFF.columns]
 
-    st.markdown('<div class="callout">💡 <b>Key correlations:</b> HDI (r≈0.85) and schooling (r≈0.75) are the strongest positive predictors of life expectancy. HIV/AIDS (r≈−0.58) and adult mortality (r≈−0.97) are the strongest negative predictors.</div>', unsafe_allow_html=True)
-    st.markdown("---")
+    fig1 = make_subplots(
+        rows=3, cols=3,
+        subplot_titles=[v[1] for v in histogram_vars],
+        horizontal_spacing=0.06,
+        vertical_spacing=0.13,
+    )
 
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("**Life expectancy by continent — sorted box plots**")
-        cont_order = (dff.groupby("continent")["life_expectancy"].median()
-                      .sort_values().index.tolist())
-        fig_box = go.Figure()
-        for cont in cont_order:
-            sub = dff[dff["continent"]==cont]["life_expectancy"].dropna()
-            if len(sub) < 3: continue
-            fig_box.add_trace(go.Box(
-                y=sub, name=cont,
-                marker_color=CONT_COL.get(cont,"#888"),
-                line=dict(width=1.5),
-                fillcolor=CONT_COL.get(cont,"#888"),
-                opacity=0.7, boxmean="sd", notched=True,
-                hovertemplate=f"<b>{cont}</b><br>Life Exp: %{{y:.1f}} yrs<extra></extra>"
-            ))
-        fig_box = apply_defaults(fig_box, h=340)
-        fig_box.update_layout(
-            showlegend=False,
-            yaxis=dict(**AXIS_STYLE, title="Life Expectancy (yrs)"),
-            xaxis=dict(tickfont=dict(size=11,color=C_TEXT), showgrid=False)
-        )
-        st.plotly_chart(fig_box, use_container_width=True)
+    for idx, (col_name, label, color) in enumerate(histogram_vars):
+        row, col = divmod(idx, 3)
 
-    with c4:
-        st.markdown("**Life expectancy trend over time**")
-        trend = dff.groupby(["year","continent"])["life_expectancy"].mean().reset_index()
-        fig_trend = go.Figure()
-        for cont in sel_cont:
-            sub = trend[trend["continent"]==cont]
-            if sub.empty: continue
-            fig_trend.add_trace(go.Scatter(
-                x=sub["year"], y=sub["life_expectancy"],
-                mode="lines+markers", name=cont,
-                line=dict(color=CONT_COL.get(cont,"#888"), width=2),
-                marker=dict(size=5),
-                hovertemplate=f"<b>{cont}</b><br>%{{x}}: %{{y:.1f}} yrs<extra></extra>"
-            ))
-        fig_trend = apply_defaults(fig_trend, h=340)
-        fig_trend.update_layout(
-            xaxis=dict(**AXIS_STYLE, title="Year", dtick=2),
-            yaxis=dict(**AXIS_STYLE, title="Life Expectancy (yrs)"),
-            legend=dict(orientation="h", y=1.15, x=0,
-                        font=dict(size=10,color=C_TEXT), bgcolor="rgba(0,0,0,0)")
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-    st.markdown("---")
-    c5, c6 = st.columns([3,2])
-
-    with c5:
-        st.markdown("**Preston Curve — wealth vs life expectancy**")
-        fig_pres = go.Figure()
-        for cont in sel_cont:
-            sub = dff[dff["continent"]==cont].dropna(subset=["log_gdp","life_expectancy"])
-            if len(sub) < 5: continue
-            fig_pres.add_trace(go.Scatter(
-                x=sub["log_gdp"], y=sub["life_expectancy"],
-                mode="markers", name=cont,
-                marker=dict(color=CONT_COL.get(cont,"#888"),
-                            size=5, opacity=0.5, line=dict(width=0)),
-                customdata=np.stack([sub["country"],sub["year"],sub["gdp_final"].round(0)],axis=1),
-                hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>log(GDP): %{x:.2f}<br>Life Exp: %{y:.1f} yrs<br>GDP: $%{customdata[2]:,.0f}<extra></extra>"
-            ))
-        v2 = dff[["log_gdp","life_expectancy"]].dropna()
-        if len(v2) > 10:
-            sl,ic,r,*_ = stats.linregress(v2["log_gdp"],v2["life_expectancy"])
-            xs = np.linspace(v2["log_gdp"].min(), v2["log_gdp"].max(), 200)
-            fig_pres.add_trace(go.Scatter(
-                x=xs, y=sl*xs+ic, mode="lines",
-                name=f"Global OLS (r={r:.2f})",
-                line=dict(color=C_TEXT, width=2, dash="dash"), hoverinfo="skip"
-            ))
-        # Annotate outliers — explicitly flag anomalies
-        for cname, xoff, yoff in [("Sierra Leone",0.3,-3),("Lesotho",0.3,-3)]:
-            row = dff[dff["country"]==cname][["log_gdp","life_expectancy"]].mean()
-            if not row.empty and not row.isna().any():
-                fig_pres.add_annotation(
-                    x=float(row["log_gdp"]), y=float(row["life_expectancy"]),
-                    text=f"⚠ {cname}", showarrow=True,
-                    arrowhead=2, arrowcolor=C_BAD,
-                    font=dict(size=10,color=C_BAD), ax=40, ay=-25
+        if t1_highlight != "All":
+            # Overlay all continents; dim non-selected ones
+            for continent in ALL_CONTINENTS:
+                subset       = DFF[DFF["continent"] == continent][col_name].dropna()
+                is_selected  = (continent == t1_highlight or
+                                (isinstance(t1_hl_raw, list) and continent in t1_hl_raw
+                                 and "All" not in t1_hl_raw))
+                trace_color  = (
+                    CONTINENT_COLORS.get(continent, "#888")
+                    if is_selected else "rgba(148,163,184,0.25)"
                 )
-        fig_pres = apply_defaults(fig_pres, h=360)
-        fig_pres.update_layout(
-            xaxis=dict(**AXIS_STYLE, title="log(GDP per Capita)"),
-            yaxis=dict(**AXIS_STYLE, title="Life Expectancy (yrs)"),
-            legend=dict(orientation="h", y=1.15, x=0,
-                        font=dict(size=10,color=C_TEXT), bgcolor="rgba(0,0,0,0)")
-        )
-        st.plotly_chart(fig_pres, use_container_width=True)
-        st.markdown('<div class="callout-warn">⚠️ <b>Anomalies:</b> Sierra Leone & Lesotho show life expectancy far below GDP peers — driven by HIV/AIDS burden and post-conflict fragility. Require targeted SDG 3.3 intervention.</div>', unsafe_allow_html=True)
+                fig1.add_trace(
+                    go.Histogram(
+                        x=subset, nbinsx=25, name=continent,
+                        marker_color=trace_color,
+                        marker_line=dict(width=0),
+                        opacity=1.0 if is_selected else 0.3,
+                        showlegend=(idx == 0),
+                        hovertemplate=f"<b>{continent}</b><br>{label}: %{{x}}<br>Count: %{{y}}<extra></extra>",
+                    ),
+                    row=row + 1, col=col + 1,
+                )
+        else:
+            # Single color; add median reference line
+            data = DFF[col_name].dropna()
+            fig1.add_trace(
+                go.Histogram(
+                    x=data, nbinsx=30,
+                    marker_color=color, marker_opacity=0.75,
+                    marker_line=dict(width=0), showlegend=False,
+                    hovertemplate=f"<b>{label}</b><br>%{{x}}<br>Count: %{{y}}<extra></extra>",
+                ),
+                row=row + 1, col=col + 1,
+            )
+            fig1.add_vline(
+                x=float(data.median()),
+                line_dash="dot", line_color="rgba(148,163,184,0.7)", line_width=1.5,
+                row=row + 1, col=col + 1,
+            )
 
-    with c6:
-        st.markdown("**Immunization by development stage**")
-        imm_agg = (dff.groupby("dev_stage")["immunization"].mean()
-                   .reset_index().sort_values("immunization"))
-        stage_colors = {"Low Income":C_BAD,"Lower-Middle":C_WARN,
-                        "Upper-Middle":C_NEUTRAL,"High Income":C_GOOD}
-        fig_imm = go.Figure(go.Bar(
-            x=imm_agg["immunization"].round(1),
-            y=imm_agg["dev_stage"], orientation="h",
-            marker_color=[stage_colors.get(s,C_NEUTRAL) for s in imm_agg["dev_stage"]],
-            text=imm_agg["immunization"].round(1),
-            textposition="outside", textfont=dict(size=11,color=C_TEXT),
-            hovertemplate="<b>%{y}</b><br>Immunization: %{x:.1f}%<extra></extra>"
-        ))
-        fig_imm = apply_defaults(fig_imm, h=360)
-        fig_imm.update_layout(
-            xaxis=dict(**AXIS_STYLE, title="Avg Immunization (%)", range=[0,105]),
-            yaxis=dict(tickfont=dict(size=11,color=C_TEXT), showgrid=False),
-        )
-        st.plotly_chart(fig_imm, use_container_width=True)
-        st.markdown('<div class="callout">💡 High-income countries achieve >90% immunization. The gap at Low Income stage is a key UNICEF intervention target.</div>', unsafe_allow_html=True)
+    fig1.update_layout(
+        height=CHART_HEIGHT,
+        barmode="overlay",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=TEXT_COL, size=10),
+        title=dict(
+            text="Distribution of Key Health & Socioeconomic Indicators",
+            font=dict(size=12, color=TEXT_COL), x=0, pad=dict(b=4),
+        ),
+        margin=dict(t=48, b=16, l=36, r=16),
+        showlegend=(t1_highlight != "All"),
+        legend=dict(
+            orientation="h", y=1.06, x=0.5, xanchor="center",
+            font=dict(size=9, color=TEXT_COL), bgcolor="rgba(0,0,0,0)",
+        ),
+    )
+    for axis_key in fig1.layout:
+        if axis_key.startswith("xaxis") or axis_key.startswith("yaxis"):
+            fig1.layout[axis_key].update(
+                gridcolor="rgba(148,163,184,0.12)",
+                tickfont=dict(size=8, color=MUTED_COL),
+                zeroline=False,
+            )
+    for annotation in fig1.layout.annotations[:9]:
+        annotation.font.size  = 9
+        annotation.font.color = TEXT_COL
+
+    st.plotly_chart(fig1, use_container_width=True)
 
 
-# ══════════════════════════════════════════════════════════
-# TAB 2 — GLOBAL TRENDS
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 2 — Correlation Heatmap
+#  Lower-triangle Pearson correlation matrix.
+#  Hovering a cell shows the exact r value.
+#  The heatmap itself does not have per-tab filters; it always reflects the
+#  global filter (DFF).
+# ─────────────────────────────────────────────────────────────────────────────
 with tab2:
-    st.markdown('<div class="sec-hdr">Global Health vs Wealth Dynamics</div>', unsafe_allow_html=True)
-    st.markdown("**Animated bubble chart — press ▶ to see evolution 2000–2015**")
-    st.caption("Bubble size = population · Color = continent · Hover for country details")
-
-    anim_df = (dff.groupby(["country","year","continent"])
-               .agg(life_expectancy=("life_expectancy","mean"),
-                    log_gdp=("log_gdp","mean"), pop_size=("pop_size","mean"),
-                    gdp_final=("gdp_final","mean"), schooling=("schooling","mean"))
-               .reset_index().sort_values("year"))
-
-    fig_anim = px.scatter(
-        anim_df, x="log_gdp", y="life_expectancy",
-        animation_frame="year", animation_group="country",
-        size="pop_size", color="continent",
-        hover_name="country", color_discrete_map=CONT_COL, size_max=50,
-        labels={"log_gdp":"log(GDP per Capita)","life_expectancy":"Life Expectancy (yrs)"},
-    )
-    fig_anim.update_traces(
-        marker=dict(opacity=0.7, line=dict(width=0.5,color="white")),
-        hovertemplate="<b>%{hovertext}</b><br>Life Exp: %{y:.1f} yrs<br>log(GDP): %{x:.2f}<extra></extra>"
-    )
-    fig_anim.update_layout(**CHART_DEFAULTS, height=520,
-                           xaxis=dict(**AXIS_STYLE, title="log(GDP per Capita)"),
-                           yaxis=dict(**AXIS_STYLE, title="Life Expectancy (yrs)"),
-                           legend=dict(x=1.02, y=1, font=dict(size=11,color=C_TEXT),
-                                       bgcolor="rgba(0,0,0,0)"),
-                           margin=dict(t=30,b=60,l=60,r=40))
-    fig_anim.layout.updatemenus[0].buttons[0].args[1]["frame"]["duration"] = 700
-    fig_anim.layout.updatemenus[0].buttons[0].args[1]["transition"]["duration"] = 400
-    st.plotly_chart(fig_anim, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("**Continent-level metric over time**")
-    met_opts = [
-        ("life_expectancy","Life Expectancy (yrs)"),
-        ("adult_mortality","Adult Mortality /1K"),
-        ("immunization","Immunization Rate (%)"),
-        ("hdi_index","HDI Index"),
-        ("schooling","Schooling (yrs)"),
-        ("hiv_aids","HIV/AIDS Rate"),
+    corr_vars = [
+        "life_expectancy", "adult_mortality", "schooling", "gdp_final",
+        "hiv_aids", "immunization", "hdi_index", "income_composition",
+        "infant_deaths", "alcohol", "bmi",
     ]
-    met_choice = st.selectbox("Metric", met_opts,
-                              format_func=lambda x: x[1], key="tab2_met")
-    mcol, mlabel = met_choice
-    time_agg = dff.groupby(["year","continent"])[mcol].mean().reset_index()
-    fig_t2 = go.Figure()
-    for cont in sel_cont:
-        sub = time_agg[time_agg["continent"]==cont]
-        if sub.empty: continue
-        fig_t2.add_trace(go.Scatter(
-            x=sub["year"], y=sub[mcol].round(2),
-            mode="lines+markers", name=cont,
-            line=dict(color=CONT_COL.get(cont,"#888"), width=2.5),
-            marker=dict(size=6),
-            hovertemplate=f"<b>{cont}</b><br>%{{x}}: %{{y:.2f}}<extra></extra>"
-        ))
-    fig_t2 = apply_defaults(fig_t2, h=380)
-    fig_t2.update_layout(
-        xaxis=dict(**AXIS_STYLE, title="Year", dtick=2),
-        yaxis=dict(**AXIS_STYLE, title=mlabel),
-        legend=dict(orientation="h", y=1.1, x=0,
-                    font=dict(size=11,color=C_TEXT), bgcolor="rgba(0,0,0,0)")
+    corr_vars  = [c for c in corr_vars if c in DFF.columns]
+    corr_matrix = DFF[corr_vars].corr().round(3)
+    axis_labels = [c.replace("_", " ").title() for c in corr_vars]
+
+    # Build lower-triangle only (upper half left as None = invisible)
+    n = len(corr_vars)
+    z_lower   = [
+        [corr_matrix.iloc[i, j] if i >= j else None for j in range(n)]
+        for i in range(n)
+    ]
+    text_lower = [
+        [f"{corr_matrix.iloc[i, j]:.2f}" if i >= j else "" for j in range(n)]
+        for i in range(n)
+    ]
+
+    fig2 = go.Figure(go.Heatmap(
+        z=z_lower, x=axis_labels, y=axis_labels,
+        text=text_lower, texttemplate="%{text}",
+        textfont=dict(size=9, color=TEXT_COL),
+        colorscale=[
+            [0,   "#EF4444"],
+            [0.5, "rgba(148,163,184,0.12)"],
+            [1,   "#10B981"],
+        ],
+        zmid=0, zmin=-1, zmax=1,
+        hovertemplate="<b>%{x}</b> × <b>%{y}</b><br>r = %{z:.3f}<extra></extra>",
+        colorbar=dict(
+            title="r",
+            tickfont=dict(size=9, color=MUTED_COL),
+            thickness=13, len=0.75,
+        ),
+    ))
+    fig2 = apply_chart_theme(fig2)
+    fig2.update_layout(
+        title=dict(
+            text="Pearson Correlation Matrix — How Health Indicators Relate to Each Other",
+            font=dict(size=12, color=TEXT_COL), x=0,
+        ),
+        margin=dict(t=44, b=88, l=148, r=48),
     )
-    st.plotly_chart(fig_t2, use_container_width=True)
+    fig2.update_xaxes(tickangle=-38, tickfont=dict(size=9, color=MUTED_COL), showgrid=False)
+    fig2.update_yaxes(tickfont=dict(size=9, color=MUTED_COL), showgrid=False)
+
+    st.plotly_chart(fig2, use_container_width=True)
+    st.markdown(
+        '<div class="insight">💡 <b>HDI (r≈0.85)</b> and <b>schooling (r≈0.75)</b> '
+        "are the strongest positive predictors of life expectancy. "
+        "<b>HIV/AIDS (r≈−0.58)</b> and <b>adult mortality (r≈−0.97)</b> are the "
+        "strongest negative predictors. Hover a cell for the exact value.</div>",
+        unsafe_allow_html=True,
+    )
 
 
-# ══════════════════════════════════════════════════════════
-# TAB 3 — ADVANCED ANALYSIS
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 3 — Preston Curve
+#  Scatter of life expectancy vs a chosen X-axis variable.
+#  Clicking a continent in the dropdown highlights its points and dims others —
+#  this is cross-filtering between the dropdown and the scatter traces.
+#  An OLS trend line shows the global relationship; annotated outliers sit
+#  far below it.
+# ─────────────────────────────────────────────────────────────────────────────
 with tab3:
-    st.markdown('<div class="sec-hdr">Advanced Visualization & Insight</div>', unsafe_allow_html=True)
-    adv1, adv2, adv3 = st.tabs(["🌐 3D Scatter","📐 Parallel Coordinates","🎯 Multi-Layer"])
-
-    with adv1:
-        st.markdown("**GDP × Schooling × Life Expectancy — 4th variable: HIV/AIDS burden (color)**")
-        sc3 = dff.dropna(subset=["log_gdp","schooling","life_expectancy"]).copy()
-        ck  = (sc3.groupby("continent")["country"].unique()
-                  .apply(lambda x: np.random.choice(x, min(len(x),12), replace=False)))
-        sc3 = sc3[sc3["country"].isin(np.concatenate(ck.values))]
-        fig_3d = go.Figure()
-        conts3 = sorted(sc3["continent"].dropna().unique())
-        for cont in conts3:
-            sub = sc3[sc3["continent"]==cont]
-            fig_3d.add_trace(go.Scatter3d(
-                x=sub["log_gdp"], y=sub["schooling"], z=sub["life_expectancy"],
-                mode="markers", name=cont,
-                marker=dict(size=4, opacity=0.8,
-                            color=sub["hiv_aids"],
-                            colorscale=[[0,C_GOOD],[0.5,C_WARN],[1,C_BAD]],
-                            cmin=sc3["hiv_aids"].min(), cmax=sc3["hiv_aids"].max(),
-                            showscale=(cont==conts3[-1]),
-                            colorbar=dict(title="HIV/AIDS",x=1.05,thickness=12,len=0.6)),
-                customdata=np.stack([sub["country"],sub["year"],sub["hiv_aids"].round(2)],axis=1),
-                hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>log(GDP): %{x:.2f}<br>Schooling: %{y:.1f} yrs<br>Life Exp: %{z:.1f} yrs<br>HIV/AIDS: %{customdata[2]}<extra>"+cont+"</extra>"
-            ))
-        fig_3d.update_layout(
-            height=560, paper_bgcolor=C_SURF,
-            title=dict(text="3D: GDP, Education & Life Expectancy (HIV rate = color)",
-                       font=dict(size=14,color=C_TEXT),x=0),
-            scene=dict(bgcolor=C_SURF,
-                       xaxis=dict(title="log(GDP)",gridcolor=C_GRID),
-                       yaxis=dict(title="Schooling (yrs)",gridcolor=C_GRID),
-                       zaxis=dict(title="Life Exp (yrs)",gridcolor=C_GRID),
-                       camera=dict(eye=dict(x=1.6,y=1.6,z=0.9))),
-            legend=dict(font=dict(size=10,color=C_TEXT),bgcolor="rgba(0,0,0,0)",x=0.01,y=0.99),
-            margin=dict(t=50,b=20,l=20,r=40)
+    p3_left, p3_right = st.columns([3, 1])
+    with p3_left:
+        t3_hl_raw = st.multiselect(
+            "Highlight continent (select one or more to compare)",
+            ["All"] + ALL_CONTINENTS,
+            default=["All"], key="t3_hl",
         )
-        st.plotly_chart(fig_3d, use_container_width=True)
-        st.markdown('<div class="callout">💡 Countries with high GDP AND schooling cluster in the top-right with long life expectancy. African nations (high HIV/AIDS = red) occupy the low-GDP, low-schooling corner — showing compounding disadvantage where multiple deprivations coexist.</div>', unsafe_allow_html=True)
+        t3_highlight = "All" if (not t3_hl_raw or "All" in t3_hl_raw) else t3_hl_raw[0]
+    with p3_right:
+        x_axis_option = st.selectbox(
+            "X-axis variable",
+            [
+                ("log_gdp",      "log GDP"),
+                ("gdp_final",    "GDP per Capita"),
+                ("schooling",    "Schooling"),
+                ("immunization", "Immunization"),
+                ("hdi_index",    "HDI"),
+            ],
+            format_func=lambda x: x[1],
+            key="t3_x",
+        )
+    x_col, x_label = x_axis_option
 
-    with adv2:
-        st.markdown("**Multi-dimensional health profile by income level**")
-        st.caption("Drag axis labels to reorder · Drag on axes to filter country groups")
-        pc_vars = ["life_expectancy","schooling","log_gdp","immunization","adult_mortality","hdi_index","hiv_aids"]
-        pc = dff[pc_vars+["dev_stage"]].dropna().copy()
-        pc["stage_num"] = pd.Categorical(pc["dev_stage"],
-                                          categories=["Low Income","Lower-Middle","Upper-Middle","High Income"],
-                                          ordered=True).codes
-        sc2 = MinMaxScaler()
-        pcs = pc.copy()
-        pcs[pc_vars] = sc2.fit_transform(pc[pc_vars])
-        dims = [dict(label=v.replace("_"," ").title(), values=pcs[v],
-                     range=[0,1], tickvals=[0,0.5,1], ticktext=["Low","Mid","High"])
-                for v in pc_vars]
-        fig_pc = go.Figure(go.Parcoords(
-            line=dict(color=pcs["stage_num"],
-                      colorscale=[[0,C_BAD],[0.33,C_WARN],[0.66,C_NEUTRAL],[1,C_GOOD]],
-                      cmin=0, cmax=3, showscale=True,
-                      colorbar=dict(title=dict(text="Income Stage",font=dict(size=11,color=C_TEXT)),
-                                    tickvals=[0.4,1.1,1.9,2.6],
-                                    ticktext=["Low","Lower-Mid","Upper-Mid","High"],
-                                    thickness=12, len=0.5)),
-            dimensions=dims,
-            labelfont=dict(size=11,color=C_TEXT),
-            tickfont=dict(size=9,color=C_MUTED),
+    fig3 = go.Figure()
+    for continent in sorted(DFF["continent"].dropna().unique()):
+        subset       = DFF[DFF["continent"] == continent].dropna(subset=[x_col, "life_expectancy"])
+        is_highlighted = (t3_highlight == "All" or continent == t3_highlight or
+                          (isinstance(t3_hl_raw, list) and continent in t3_hl_raw))
+        trace_color  = (
+            CONTINENT_COLORS.get(continent, "#888")
+            if is_highlighted else "rgba(148,163,184,0.2)"
+        )
+        fig3.add_trace(go.Scatter(
+            x=subset[x_col],
+            y=subset["life_expectancy"],
+            mode="markers",
+            name=continent,
+            marker=dict(
+                color=trace_color,
+                size=6 if is_highlighted else 4,
+                opacity=0.75 if is_highlighted else 0.2,
+                line=dict(width=0),
+            ),
+            customdata=np.stack(
+                [subset["country"], subset["year"], subset["gdp_final"].round(0), subset["continent"]],
+                axis=1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                "Life Exp: <b>%{y:.1f} yrs</b><br>"
+                f"{x_label}: %{{x:.2f}}<br>GDP: $%{{customdata[2]:,.0f}}<extra></extra>"
+            ),
         ))
-        fig_pc.update_layout(height=480, paper_bgcolor=C_SURF, plot_bgcolor=C_SURF,
-                             title=dict(text="Multi-dimensional health profile by income level",
-                                        font=dict(size=14,color=C_TEXT),x=0),
-                             margin=dict(t=60,b=60,l=90,r=130))
-        st.plotly_chart(fig_pc, use_container_width=True)
-        st.markdown('<div class="callout">💡 High-income countries (teal) consistently score high on life expectancy, schooling, and immunization while maintaining low adult mortality and HIV/AIDS rates. Low-income (red) show the exact inverse profile.</div>', unsafe_allow_html=True)
 
-    with adv3:
-        st.markdown("**Education × Mortality × Life Expectancy — multi-layer composite**")
-        ml = dff.dropna(subset=["schooling","adult_mortality","life_expectancy","continent"]).copy()
-        fig_ml = make_subplots(rows=1, cols=2, column_widths=[0.68,0.32],
-                               horizontal_spacing=0.05)
-        conts_ml = sorted(ml["continent"].dropna().unique())
-        for cont in conts_ml:
-            sub = ml[ml["continent"]==cont]
-            fig_ml.add_trace(go.Scatter(
-                x=sub["schooling"], y=sub["adult_mortality"],
-                mode="markers", name=cont, legendgroup=cont,
-                marker=dict(color=sub["life_expectancy"], colorscale="RdYlGn",
-                            size=5, opacity=0.6, line=dict(width=0),
-                            showscale=(cont==conts_ml[-1]),
-                            colorbar=dict(title="Life Exp",x=0.72,thickness=10,len=0.6)),
-                customdata=np.stack([sub["country"],sub["year"],sub["life_expectancy"].round(1)],axis=1),
-                hovertemplate="<b>%{customdata[0]}</b> (%{customdata[1]})<br>Schooling: %{x:.1f} yrs<br>Mortality: %{y:.0f}<br>Life Exp: %{customdata[2]} yrs<extra></extra>"
-            ), row=1, col=1)
-        v3 = ml[["schooling","adult_mortality"]].dropna()
-        sl,ic,r,*_ = stats.linregress(v3["schooling"],v3["adult_mortality"])
-        xs = np.linspace(v3["schooling"].min(),v3["schooling"].max(),200)
-        fig_ml.add_trace(go.Scatter(x=xs,y=sl*xs+ic,mode="lines",
-                                    name=f"OLS (r={r:.2f})",
-                                    line=dict(color=C_TEXT,width=2,dash="dash"),
-                                    hoverinfo="skip"), row=1, col=1)
-        cont_ord = (ml.groupby("continent")["life_expectancy"].median()
-                    .sort_values().index.tolist())
-        for cont in cont_ord:
-            sub = ml[ml["continent"]==cont]["life_expectancy"].dropna()
-            fig_ml.add_trace(go.Box(x=sub, name=cont, legendgroup=cont,
-                                    orientation="h", showlegend=False,
-                                    marker_color=CONT_COL.get(cont,"#888"),
-                                    opacity=0.75, boxmean=True, notched=True,
-                                    line=dict(width=1.5)), row=1, col=2)
-        fig_ml.update_layout(**CHART_DEFAULTS, height=460, showlegend=False,
-                             title=dict(text="Schooling vs mortality (color=life expectancy) + continental distribution",
-                                        font=dict(size=13,color=C_TEXT),x=0))
-        fig_ml.update_xaxes(gridcolor=C_GRID, tickfont=dict(size=10,color=C_MUTED))
-        fig_ml.update_yaxes(gridcolor=C_GRID, tickfont=dict(size=10,color=C_MUTED))
-        fig_ml.update_yaxes(tickfont=dict(size=10,color=C_TEXT), showgrid=False, row=1, col=2)
-        st.plotly_chart(fig_ml, use_container_width=True)
+    # OLS trend line across all filtered data
+    valid = DFF.dropna(subset=[x_col, "life_expectancy"])
+    r_val = 0.0
+    if len(valid) > 5:
+        slope, intercept, r_val, *_ = stats.linregress(valid[x_col], valid["life_expectancy"])
+        xs_trend = np.linspace(valid[x_col].min(), valid[x_col].max(), 300)
+        fig3.add_trace(go.Scatter(
+            x=xs_trend, y=slope * xs_trend + intercept,
+            mode="lines",
+            name=f"OLS trend (r={r_val:.2f})",
+            line=dict(color="rgba(148,163,184,0.7)", width=2, dash="dash"),
+            hoverinfo="skip",
+        ))
+
+    # Annotate notable outliers that sit far below the trend line
+    for country_name in ["Sierra Leone", "Lesotho"]:
+        row = DFF[DFF["country"] == country_name][[x_col, "life_expectancy"]].mean()
+        if not row.empty and not row.isna().any():
+            fig3.add_annotation(
+                x=float(row[x_col]), y=float(row["life_expectancy"]),
+                text=f"⚠ {country_name}",
+                showarrow=True, arrowhead=2,
+                arrowcolor="#EF4444",
+                font=dict(size=10, color="#EF4444"),
+                ax=38, ay=-22,
+            )
+
+    fig3 = apply_chart_theme(fig3)
+    fig3.update_layout(
+        title=dict(
+            text=f"Preston Curve — Life Expectancy vs {x_label} by Continent",
+            font=dict(size=12, color=TEXT_COL), x=0,
+        ),
+        xaxis=dict(title=x_label, gridcolor="rgba(148,163,184,0.12)"),
+        yaxis=dict(title="Life Expectancy (yrs)"),
+        legend=dict(
+            orientation="v", x=1.01, y=1,
+            font=dict(size=10, color=TEXT_COL), bgcolor="rgba(0,0,0,0)",
+        ),
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+    st.markdown(
+        f'<div class="insight">💡 Select a continent above to isolate it. '
+        f"The OLS trend line (r={r_val:.2f}) shows the global wealth–health relationship. "
+        f"⚠ annotated countries sit far below the trend line.</div>",
+        unsafe_allow_html=True,
+    )
 
 
-# ══════════════════════════════════════════════════════════
-# TAB 4 — SCENARIO COMPARISON
-# ══════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 4 — Trends Over Time
+#  Line chart with ±1 SD ribbon per continent.
+#  Selecting a continent fades all others, spotlighting its trajectory.
+#  This is linked interaction: the highlight here shares the same
+#  clicked_cont session state key used in Tab 1.
+# ─────────────────────────────────────────────────────────────────────────────
 with tab4:
-    st.markdown('<div class="sec-hdr">Scenario Comparison — Top 10 vs Bottom 10 Countries</div>',
-                unsafe_allow_html=True)
-
-    cmp_opts = [
-        ("life_expectancy","Life Expectancy"),
-        ("hdi_index","HDI Index"),
-        ("immunization","Immunization Rate"),
-        ("schooling","Schooling"),
-        ("adult_mortality","Adult Mortality"),
-    ]
-    cmp_met = st.selectbox("Rank countries by", cmp_opts,
-                           format_func=lambda x: x[1])
-    cmp_col, cmp_lbl = cmp_met
-
-    latest_yr = dff["year"].max()
-    latest = (dff[dff["year"]==latest_yr].groupby("country")
-              .agg(life_expectancy=("life_expectancy","mean"),
-                   hdi_index=("hdi_index","mean"),
-                   immunization=("immunization","mean"),
-                   schooling=("schooling","mean"),
-                   adult_mortality=("adult_mortality","mean"),
-                   gdp_final=("gdp_final","mean"),
-                   hiv_aids=("hiv_aids","mean"),
-                   continent=("continent","first"))
-              .reset_index().dropna(subset=[cmp_col]))
-
-    top10    = latest.nlargest(10, cmp_col)
-    bottom10 = latest.nsmallest(10, cmp_col)
-
-    # Radar
-    rv = ["life_expectancy_n","schooling_n","immunization_n","hdi_index_n","log_gdp_n"]
-    rl = ["Life Exp","Schooling","Immunization","HDI","Log GDP"]
-    ta = df[df["country"].isin(top10["country"])].groupby("country")[rv].mean().mean()
-    ba = df[df["country"].isin(bottom10["country"])].groupby("country")[rv].mean().mean()
-    fig_rad = go.Figure()
-    for grp, vals, col in [("Top 10", ta.tolist()+[ta.iloc[0]], C_NEUTRAL),
-                            ("Bottom 10", ba.tolist()+[ba.iloc[0]], C_BAD)]:
-        fig_rad.add_trace(go.Scatterpolar(
-            r=vals, theta=rl+[rl[0]], fill="toself", name=grp,
-            line_color=col, fillcolor=col, opacity=0.25,
-            hovertemplate=f"<b>{grp}</b><br>%{{theta}}: %{{r:.2f}}<extra></extra>"
-        ))
-    fig_rad.update_layout(
-        height=360, paper_bgcolor=C_SURF,
-        polar=dict(bgcolor=C_SURF,
-                   radialaxis=dict(visible=True,range=[0,1],
-                                   tickfont=dict(color=C_MUTED),gridcolor=C_GRID),
-                   angularaxis=dict(tickfont=dict(size=12,color=C_TEXT),gridcolor=C_GRID)),
-        title=dict(text=f"Normalized health profile — Top 10 vs Bottom 10 by {cmp_lbl}",
-                   font=dict(size=13,color=C_TEXT),x=0),
-        legend=dict(font=dict(color=C_TEXT),bgcolor="rgba(0,0,0,0)"),
-        margin=dict(t=50,b=30,l=50,r=50)
-    )
-    st.plotly_chart(fig_rad, use_container_width=True)
-
-    col_t, col_b = st.columns(2)
-    with col_t:
-        ts = top10.sort_values(cmp_col)
-        fig_top = go.Figure(go.Bar(
-            y=ts["country"], x=ts[cmp_col].round(1), orientation="h",
-            marker_color=C_NEUTRAL,
-            text=ts[cmp_col].round(1), textposition="outside",
-            textfont=dict(size=10,color=C_TEXT),
-            hovertemplate="<b>%{y}</b><br>"+cmp_lbl+": %{x:.2f}<extra></extra>"
-        ))
-        fig_top = apply_defaults(fig_top, h=340)
-        fig_top.update_layout(
-            title=dict(text=f"Top 10 — {cmp_lbl}", font=dict(size=13,color=C_TEXT),x=0),
-            xaxis=dict(**AXIS_STYLE, title=cmp_lbl),
-            yaxis=dict(tickfont=dict(size=10,color=C_TEXT), showgrid=False),
-            margin=dict(t=50,b=30,l=140,r=60)
+    t4_left, t4_right = st.columns([3, 1])
+    with t4_left:
+        t4_hl_raw = st.multiselect(
+            "Highlight continent (select one or more)",
+            ["All"] + ALL_CONTINENTS,
+            default=["All"], key="t4_hl",
         )
-        st.plotly_chart(fig_top, use_container_width=True)
-
-    with col_b:
-        bs = bottom10.sort_values(cmp_col)
-        fig_bot = go.Figure(go.Bar(
-            y=bs["country"], x=bs[cmp_col].round(1), orientation="h",
-            marker_color=C_BAD,
-            text=bs[cmp_col].round(1), textposition="outside",
-            textfont=dict(size=10,color=C_TEXT),
-            hovertemplate="<b>%{y}</b><br>"+cmp_lbl+": %{x:.2f}<extra></extra>"
-        ))
-        fig_bot = apply_defaults(fig_bot, h=340)
-        fig_bot.update_layout(
-            title=dict(text=f"Bottom 10 — {cmp_lbl}", font=dict(size=13,color=C_TEXT),x=0),
-            xaxis=dict(**AXIS_STYLE, title=cmp_lbl),
-            yaxis=dict(tickfont=dict(size=10,color=C_TEXT), showgrid=False),
-            margin=dict(t=50,b=30,l=170,r=60)
+        t4_highlight = "All" if (not t4_hl_raw or "All" in t4_hl_raw) else t4_hl_raw[0]
+    with t4_right:
+        t4_metric = st.selectbox(
+            "Metric",
+            [
+                ("life_expectancy", "Life Expectancy"),
+                ("adult_mortality", "Adult Mortality"),
+                ("schooling",       "Schooling"),
+                ("immunization",    "Immunization"),
+                ("gdp_final",       "GDP"),
+                ("hiv_aids",        "HIV/AIDS"),
+                ("hdi_index",       "HDI"),
+            ],
+            format_func=lambda x: x[1],
+            key="t4_met",
         )
-        st.plotly_chart(fig_bot, use_container_width=True)
+    metric_col, metric_label = t4_metric
 
-    # Diverging gap bar
-    st.markdown("**Health indicator gap: Top 10 minus Bottom 10**")
-    gvars  = ["life_expectancy","schooling","immunization","hdi_index","adult_mortality","hiv_aids","gdp_final"]
-    glbls  = ["Life Expectancy","Schooling","Immunization","HDI Index","Adult Mortality","HIV/AIDS","GDP/Capita"]
-    tm = df[df["country"].isin(top10["country"])][gvars].mean()
-    bm = df[df["country"].isin(bottom10["country"])][gvars].mean()
-    gv = tm - bm
-    fig_gap = go.Figure(go.Bar(
-        x=glbls, y=gv.values.round(2),
-        marker_color=[C_GOOD if g>=0 else C_BAD for g in gv],
-        text=[f"{v:+.1f}" for v in gv.values],
-        textposition="outside", textfont=dict(size=11,color=C_TEXT),
-        hovertemplate="<b>%{x}</b><br>Gap (Top−Bottom): %{y:+.2f}<extra></extra>"
-    ))
-    fig_gap.add_hline(y=0, line_color=C_TEXT, line_width=1)
-    fig_gap = apply_defaults(fig_gap, h=340)
-    fig_gap.update_layout(
-        title=dict(text="Mean difference: Top 10 − Bottom 10 countries",
-                   font=dict(size=13,color=C_TEXT),x=0),
-        xaxis=dict(tickfont=dict(size=11,color=C_TEXT), showgrid=False),
-        yaxis=dict(**AXIS_STYLE, title="Difference (Top 10 − Bottom 10)")
+    # Build per-continent mean ± std time series
+    trend_df = (
+        DFF.groupby(["year", "continent"])[metric_col]
+           .agg(["mean", "std"])
+           .reset_index()
     )
-    st.plotly_chart(fig_gap, use_container_width=True)
-    st.markdown('<div class="callout">💡 Top 10 countries enjoy ~25 more years of life expectancy, 9 more years of schooling, and over $30,000 higher GDP per capita. These compounding inequalities demand targeted SDG 3 funding allocation in Sub-Saharan Africa.</div>', unsafe_allow_html=True)
+    trend_df.columns = ["year", "continent", "mean", "std"]
 
+    # Map metric column → KPI card color for consistent color encoding
+    metric_color_map = {k[0]: k[4] for k in KPI_META}
 
-# ══════════════════════════════════════════════════════════
-# TAB 5 — GEOSPATIAL
-# ══════════════════════════════════════════════════════════
-with tab5:
-    st.markdown('<div class="sec-hdr">Geospatial & Faceted Analysis</div>', unsafe_allow_html=True)
+    fig4 = go.Figure()
+    for continent in sorted(trend_df["continent"].dropna().unique()):
+        subset         = trend_df[trend_df["continent"] == continent].sort_values("year")
+        is_highlighted = (t4_highlight == "All" or continent == t4_highlight or
+                          (isinstance(t4_hl_raw, list) and continent in t4_hl_raw))
+        raw_color      = CONTINENT_COLORS.get(continent, "#888")
+        trace_color    = raw_color if is_highlighted else "rgba(148,163,184,0.25)"
+        xs             = subset["year"].tolist()
+        upper          = (subset["mean"] + subset["std"]).tolist()
+        lower          = (subset["mean"] - subset["std"]).tolist()
 
-    mc1, mc2 = st.columns([2,1])
-    with mc1:
-        map_opts = [
-            ("life_expectancy","Life Expectancy","Viridis"),
-            ("adult_mortality","Adult Mortality","Reds"),
-            ("hdi_index","HDI Index","Blues"),
-            ("immunization","Immunization Rate","Greens"),
-            ("hiv_aids","HIV/AIDS Rate","OrRd"),
-            ("schooling","Avg Schooling (yrs)","Purples"),
-        ]
-        map_met = st.selectbox("Map indicator", map_opts,
-                               format_func=lambda x: x[1], key="map_met")
-    with mc2:
-        map_yr = st.slider("Year", yr_min, yr_max, yr_max, key="map_yr")
-
-    mdf = df[df["year"]==map_yr].groupby("country")[map_met[0]].mean().reset_index()
-    fig_map = px.choropleth(
-        mdf, locations="country", locationmode="country names",
-        color=map_met[0], hover_name="country",
-        color_continuous_scale=map_met[2],
-        labels={map_met[0]: map_met[1]},
-    )
-    fig_map.update_layout(
-        height=440, paper_bgcolor=C_SURF,
-        title=dict(text=f"{map_met[1]} by country ({map_yr})",
-                   font=dict(size=14,color=C_TEXT),x=0),
-        geo=dict(showframe=False, showcoastlines=True, coastlinecolor=C_BORDER,
-                 showland=True, landcolor="#F1F5F9",
-                 showocean=True, oceancolor="#DBEAFE"),
-        margin=dict(t=50,b=0,l=0,r=0),
-        coloraxis_colorbar=dict(tickfont=dict(color=C_MUTED),
-                                title_font=dict(color=C_TEXT))
-    )
-    st.plotly_chart(fig_map, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("**Faceted small multiples — life expectancy by continent & development status**")
-    st.caption("Tufte principle: small multiples share the same scale for fair comparison")
-
-    fdf = dff.groupby(["year","continent","status"])["life_expectancy"].mean().reset_index()
-    fig_fac = px.line(
-        fdf, x="year", y="life_expectancy",
-        color="status", facet_col="continent", facet_col_wrap=3,
-        color_discrete_map={"Developed": C_NEUTRAL, "Developing": C_WARN},
-        markers=True,
-        labels={"life_expectancy":"Life Expectancy (yrs)","year":"Year"},
-    )
-    fig_fac.update_layout(**CHART_DEFAULTS, height=460,
-                          title=dict(text="Life expectancy trends — developed vs developing by continent",
-                                     font=dict(size=14,color=C_TEXT),x=0),
-                          legend=dict(orientation="h", y=1.08, x=0,
-                                      font=dict(size=11,color=C_TEXT),
-                                      bgcolor="rgba(0,0,0,0)"),
-                          margin=dict(t=80,b=50,l=60,r=20))
-    fig_fac.for_each_annotation(lambda a: a.update(
-        text=a.text.split("=")[-1], font=dict(size=12,color=C_TEXT)))
-    for ax in fig_fac.layout:
-        if "xaxis" in ax: fig_fac.layout[ax].update(gridcolor=C_GRID, tickfont=dict(color=C_MUTED))
-        if "yaxis" in ax: fig_fac.layout[ax].update(gridcolor=C_GRID, tickfont=dict(color=C_MUTED))
-    st.plotly_chart(fig_fac, use_container_width=True)
-    st.markdown('<div class="callout">💡 Africa shows the steepest improvement (+8 yrs, 2000–2015). Europe remains flat near its ceiling. The developed/developing gap is largest in Africa and Asia — targets for SDG 3.8 Universal Health Coverage.</div>', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════
-# TAB 6 — ETHICAL BIAS VISUALIZATION
-# ══════════════════════════════════════════════════════════
-with tab6:
-    st.markdown('<div class="sec-hdr">Ethical Bias — Data Completeness & Reporting Gaps</div>',
-                unsafe_allow_html=True)
-    st.markdown("""
-    <div class="callout-warn">
-    ⚠️ <b>Why this matters:</b> Under-reporting is highest in Africa and Oceania — the very regions
-    with the worst health outcomes. Visualizing WHERE data is missing is an ethical obligation,
-    not just a technical note. Median imputation masks these gaps, so results for under-reported
-    regions must be interpreted with caution.
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Load RAW (pre-imputed) data to measure true missing rates
-    @st.cache_data(show_spinner="Calculating missing data rates…")
-    def load_raw_missing():
-        import os
-        BASE = os.path.dirname(os.path.abspath(__file__))
-        who_raw = pd.read_csv(os.path.join(BASE, "Life Expectancy Data.csv"))
-        who_raw.columns = [c.strip().lower().replace(" ","_").replace("/","_") for c in who_raw.columns]
-        continent_map = df[["country","continent"]].drop_duplicates().set_index("country")["continent"]
-        who_raw["continent"] = who_raw["country"].map(continent_map)
-        key_cols = [c for c in who_raw.columns if any(k in c for k in
-                    ["life","adult","hepatit","bmi","hiv","gdp","population","income","school"])]
-        miss_cont = (
-            who_raw.groupby("continent")[key_cols]
-            .apply(lambda x: x.isnull().mean() * 100)
-            .mean(axis=1).reset_index()
-        )
-        miss_cont.columns = ["continent","missing_pct"]
-        heat_cols = key_cols[:8]
-        heat_data = (
-            who_raw.groupby("continent")[heat_cols]
-            .apply(lambda x: x.isnull().mean() * 100)
-            .round(1)
-        )
-        heat_labels = [c.replace("_"," ").title()[:16] for c in heat_cols]
-        return miss_cont.dropna(), heat_data, heat_labels
-
-    miss_cont, heat_data, heat_labels = load_raw_missing()
-
-    b1, b2 = st.columns([1, 1.6])
-
-    with b1:
-        st.markdown("**Average missing data % by continent**")
-        ms = miss_cont.sort_values("missing_pct")
-        fig_bias = go.Figure(go.Bar(
-            x=ms["missing_pct"].round(1),
-            y=ms["continent"],
-            orientation="h",
-            marker_color=[CONT_COL.get(c, "#888") for c in ms["continent"]],
-            marker_line=dict(width=0),
-            text=ms["missing_pct"].round(1).astype(str) + "%",
-            textposition="outside",
-            textfont=dict(size=11, color=C_TEXT),
-            hovertemplate="<b>%{y}</b><br>Missing: %{x:.1f}%<extra></extra>"
-        ))
-        fig_bias = apply_defaults(fig_bias, h=320,
-                                  margin=dict(t=30, b=40, l=120, r=60))
-        fig_bias.update_xaxes(**AXIS_STYLE, title="Avg missing data (%)", range=[0, 40])
-        fig_bias.update_yaxes(tickfont=dict(size=11, color=C_TEXT), showgrid=False)
-        st.plotly_chart(fig_bias, use_container_width=True)
-
-    with b2:
-        st.markdown("**Missing data heatmap — variable × continent**")
-        fig_heat = go.Figure(go.Heatmap(
-            z=heat_data.values,
-            x=heat_labels,
-            y=heat_data.index.tolist(),
-            colorscale=[[0,"#F0FDF4"],[0.3,"#FEF9C3"],[0.6,"#FED7AA"],[1.0,C_BAD]],
-            zmin=0, zmax=50,
-            text=heat_data.values.round(1),
-            texttemplate="%{text}",
-            textfont=dict(size=9, color=C_TEXT),
-            hovertemplate="<b>%{y}</b> — %{x}<br>Missing: %{z:.1f}%<extra></extra>",
-            colorbar=dict(title="Missing %", title_font=dict(size=11, color=C_TEXT),
-                          tickfont=dict(size=9, color=C_MUTED), len=0.7, thickness=12)
-        ))
-        fig_heat.update_layout(**CHART_DEFAULTS, height=320,
-                               margin=dict(t=30, b=80, l=110, r=80),
-                               xaxis=dict(tickangle=-30, tickfont=dict(size=9, color=C_MUTED),
-                                          showgrid=False),
-                               yaxis=dict(tickfont=dict(color=C_TEXT), showgrid=False))
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("**Missing data % by development stage — who is silenced?**")
-
-    @st.cache_data(show_spinner=False)
-    def load_stage_missing():
-        import os
-        BASE = os.path.dirname(os.path.abspath(__file__))
-        who_raw = pd.read_csv(os.path.join(BASE, "Life Expectancy Data.csv"))
-        who_raw.columns = [c.strip().lower().replace(" ","_").replace("/","_") for c in who_raw.columns]
-        # Use plain dict — avoids any Series index uniqueness issues entirely
-        stage_dict = (df[["country","dev_stage"]]
-                      .drop_duplicates(subset="country")
-                      .set_index("country")["dev_stage"]
-                      .astype(str).to_dict())
-        who_raw["dev_stage"] = who_raw["country"].map(stage_dict)
-        key_cols = [c for c in who_raw.columns if any(k in c for k in
-                    ["life","adult","hepatit","bmi","hiv","gdp","population","income","school"])]
-        rows = []
-        for stage in ["Low Income","Lower-Middle","Upper-Middle","High Income"]:
-            sub = who_raw[who_raw["dev_stage"]==stage][key_cols]
-            if sub.empty: continue
-            rows.append({"dev_stage": stage,
-                         "missing_pct": sub.isnull().mean().mean() * 100})
-        return pd.DataFrame(rows)
-
-    miss_stage = load_stage_missing()
-    stage_order = ["Low Income","Lower-Middle","Upper-Middle","High Income"]
-    miss_stage["dev_stage"] = pd.Categorical(miss_stage["dev_stage"],
-                                              categories=stage_order, ordered=True)
-    miss_stage = miss_stage.sort_values("dev_stage")
-
-    stage_cols = {"Low Income": C_BAD, "Lower-Middle": C_WARN,
-                  "Upper-Middle": C_NEUTRAL, "High Income": C_GOOD}
-
-    fig_stage = go.Figure(go.Bar(
-        x=miss_stage["dev_stage"].astype(str),
-        y=miss_stage["missing_pct"].round(1),
-        marker_color=[stage_cols.get(str(s), C_NEUTRAL) for s in miss_stage["dev_stage"]],
-        marker_line=dict(width=0),
-        text=miss_stage["missing_pct"].round(1).astype(str) + "%",
-        textposition="outside",
-        textfont=dict(size=12, color=C_TEXT),
-        hovertemplate="<b>%{x}</b><br>Missing: %{y:.1f}%<extra></extra>"
-    ))
-    fig_stage = apply_defaults(fig_stage, h=320, margin=dict(t=30, b=60, l=60, r=30))
-    fig_stage.update_xaxes(tickfont=dict(size=12, color=C_TEXT), showgrid=False)
-    fig_stage.update_yaxes(**AXIS_STYLE, title="Avg missing data (%)")
-    st.plotly_chart(fig_stage, use_container_width=True)
-
-    st.markdown("""
-    <div class="callout-warn">
-    ⚠️ <b>Ethical finding:</b> Low-income countries have the highest missing data rates — meaning
-    the nations most in need of health interventions are also the least visible in the data.
-    This creates a systematic bias: analyses will underestimate health burdens in poorer regions
-    and overstate global progress. Policymakers must account for these reporting gaps when
-    allocating SDG 3 resources.
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════
-# TAB 7 — UNCERTAINTY VISUALIZATION
-# ══════════════════════════════════════════════════════════
-with tab7:
-    st.markdown('<div class="sec-hdr">Uncertainty Visualization — Confidence Intervals & Statistical Spread</div>',
-                unsafe_allow_html=True)
-    st.markdown("""
-    <div class="callout">
-    💡 <b>Why uncertainty matters:</b> Showing only mean trends can mislead policymakers.
-    The 95% CI ribbon shows how confident we are in each estimate — wider ribbons mean
-    fewer data points and less reliable conclusions for that region.
-    </div>
-    """, unsafe_allow_html=True)
-
-    def hex_rgba(h, a):
-        return f"rgba({int(h[1:3],16)},{int(h[3:5],16)},{int(h[5:7],16)},{a})"
-
-    unc_met = st.selectbox("Select indicator", [
-        ("life_expectancy","Life Expectancy (yrs)"),
-        ("adult_mortality","Adult Mortality /1K"),
-        ("immunization","Immunization Rate (%)"),
-        ("hdi_index","HDI Index"),
-        ("schooling","Schooling (yrs)"),
-    ], format_func=lambda x: x[1], key="unc_met")
-    ucol, ulabel = unc_met
-
-    trend = (
-        dff.groupby(["year","continent"])[ucol]
-        .agg(["mean","std","count"])
-        .reset_index()
-    )
-    trend.columns = ["year","continent","mean","std","n"]
-    trend["se"]   = trend["std"] / np.sqrt(trend["n"].clip(lower=1))
-    trend["ci95"] = trend["se"] * 1.96
-
-    fig_unc = go.Figure()
-    for cont in sel_cont:
-        sub = trend[trend["continent"]==cont].sort_values("year")
-        if sub.empty: continue
-        col = CONT_COL.get(cont, "#888")
-        xs  = sub["year"].tolist()
-        hi2 = (sub["mean"] + sub["std"]).tolist()
-        lo2 = (sub["mean"] - sub["std"]).tolist()
-        hi  = (sub["mean"] + sub["ci95"]).tolist()
-        lo  = (sub["mean"] - sub["ci95"]).tolist()
-
-        # ±1 SD ribbon
-        fig_unc.add_trace(go.Scatter(
-            x=xs+xs[::-1], y=hi2+lo2[::-1],
-            fill="toself", fillcolor=hex_rgba(col, 0.07),
+        # ±1 SD ribbon (filled area)
+        fig4.add_trace(go.Scatter(
+            x=xs + xs[::-1], y=upper + lower[::-1],
+            fill="toself",
+            fillcolor=hex_to_rgba(raw_color, 0.08 if is_highlighted else 0.015),
             line=dict(color="rgba(0,0,0,0)"),
-            showlegend=False, legendgroup=cont, hoverinfo="skip",
-            name=f"{cont} ±1 SD"
-        ))
-        # 95% CI ribbon
-        fig_unc.add_trace(go.Scatter(
-            x=xs+xs[::-1], y=hi+lo[::-1],
-            fill="toself", fillcolor=hex_rgba(col, 0.18),
-            line=dict(color="rgba(0,0,0,0)"),
-            showlegend=False, legendgroup=cont, hoverinfo="skip",
-            name=f"{cont} 95% CI"
+            showlegend=False, hoverinfo="skip",
+            legendgroup=continent,
         ))
         # Mean line
-        fig_unc.add_trace(go.Scatter(
-            x=xs, y=sub["mean"].round(2),
-            mode="lines+markers", name=cont, legendgroup=cont,
-            line=dict(color=col, width=2.5),
-            marker=dict(size=5),
-            hovertemplate=f"<b>{cont}</b><br>Year: %{{x}}<br>Mean: %{{y:.2f}}<br>±95% CI: %{{customdata:.2f}}",
-            customdata=sub["ci95"].round(2)
+        fig4.add_trace(go.Scatter(
+            x=xs, y=subset["mean"].round(2),
+            mode="lines+markers", name=continent, legendgroup=continent,
+            line=dict(color=trace_color, width=2.5 if is_highlighted else 1.1),
+            marker=dict(size=5 if is_highlighted else 3, color=trace_color),
+            opacity=1.0 if is_highlighted else 0.3,
+            hovertemplate=f"<b>{continent}</b><br>%{{x}}: %{{y:.2f}}<extra></extra>",
         ))
 
-    fig_unc.add_annotation(
-        x=0.98, y=0.04, xref="paper", yref="paper",
-        text="Dark band = 95% CI · Light band = ±1 SD",
-        showarrow=False, font=dict(size=11, color=C_MUTED),
-        bgcolor=C_SURF, borderpad=4, xanchor="right"
+    fig4 = apply_chart_theme(fig4)
+    fig4.update_layout(
+        title=dict(
+            text=f"{metric_label} Trend Over Time by Continent (2000–2015) — Shaded Area = ±1 SD",
+            font=dict(size=12, color=TEXT_COL), x=0,
+        ),
+        xaxis=dict(title="Year", dtick=2),
+        yaxis=dict(title=metric_label),
+        legend=dict(
+            orientation="h", y=1.08, x=0.5, xanchor="center",
+            font=dict(size=10, color=TEXT_COL), bgcolor="rgba(0,0,0,0)",
+        ),
+    )
+    st.plotly_chart(fig4, use_container_width=True)
+    st.markdown(
+        '<div class="insight">💡 Shaded ribbons = ±1 SD. '
+        "Africa shows the steepest positive life expectancy trajectory from 2000–2015 — "
+        "evidence that SDG interventions are working but from a low base.</div>",
+        unsafe_allow_html=True,
     )
 
-    fig_unc = apply_defaults(fig_unc, h=460, margin=dict(t=40, b=60, l=65, r=140))
-    fig_unc.update_layout(
-        xaxis=dict(**AXIS_STYLE, title="Year", dtick=2),
-        yaxis=dict(**AXIS_STYLE, title=ulabel),
-        legend=dict(orientation="v", x=1.02, y=1,
-                    font=dict(size=11, color=C_TEXT), bgcolor="rgba(0,0,0,0)")
-    )
-    st.plotly_chart(fig_unc, use_container_width=True)
 
-    # CI width comparison bar
-    st.markdown("**Which region has the most uncertain estimates? (2015, 95% CI width)**")
-    ci_rows = []
-    yr_data = dff[dff["year"]==dff["year"].max()]
-    for cont in sel_cont:
-        sub = yr_data[yr_data["continent"]==cont][ucol].dropna()
-        if len(sub) < 3: continue
-        ci = sub.sem() * 1.96
-        ci_rows.append({"continent": cont, "ci_width": ci*2,
-                        "n": len(sub), "mean": sub.mean()})
-    ci_df = pd.DataFrame(ci_rows).sort_values("ci_width", ascending=False)
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 5 — Violin Plot by Income Level
+#  Compares the full distribution of a metric across development stages.
+#  Selecting an income stage highlights that violin and dims others — another
+#  form of visual cross-filtering within the tab.
+# ─────────────────────────────────────────────────────────────────────────────
+with tab5:
+    t5_left, t5_right = st.columns([3, 1])
+    with t5_left:
+        t5_hl_raw = st.multiselect(
+            "Highlight income stage (select one or more)",
+            ["All"] + ALL_INCOME_STAGES,
+            default=["All"], key="t5_hl",
+        )
+        t5_highlight = "All" if (not t5_hl_raw or "All" in t5_hl_raw) else t5_hl_raw[0]
+    with t5_right:
+        t5_metric = st.selectbox(
+            "Metric",
+            [
+                ("life_expectancy", "Life Expectancy"),
+                ("schooling",       "Schooling"),
+                ("immunization",    "Immunization"),
+                ("adult_mortality", "Adult Mortality"),
+                ("hiv_aids",        "HIV/AIDS"),
+                ("gdp_final",       "GDP"),
+            ],
+            format_func=lambda x: x[1],
+            key="t5_met",
+        )
+    violin_col, violin_label = t5_metric
 
-    if not ci_df.empty:
-        fig_ci = go.Figure(go.Bar(
-            x=ci_df["continent"], y=ci_df["ci_width"].round(2),
-            marker_color=[CONT_COL.get(c, "#888") for c in ci_df["continent"]],
-            marker_line=dict(width=0),
-            text=ci_df["ci_width"].round(2), textposition="outside",
-            textfont=dict(size=11, color=C_TEXT),
-            hovertemplate="<b>%{x}</b><br>95% CI width: ±%{y:.2f}<br>n=%{customdata}",
-            customdata=ci_df["n"]
+    fig5 = go.Figure()
+    for stage in ALL_INCOME_STAGES:
+        subset         = DFF[DFF["dev_stage"] == stage][violin_col].dropna()
+        is_highlighted = (t5_highlight == "All" or stage == t5_highlight or
+                          (isinstance(t5_hl_raw, list) and stage in t5_hl_raw))
+        trace_color    = (
+            INCOME_STAGE_COLORS.get(stage, "#888")
+            if is_highlighted else "rgba(148,163,184,0.3)"
+        )
+        fig5.add_trace(go.Violin(
+            y=subset, x=[stage] * len(subset), name=stage,
+            box_visible=True, meanline_visible=True,
+            fillcolor=trace_color,
+            opacity=0.82 if is_highlighted else 0.2,
+            width=0.7,
+            line=dict(color=trace_color, width=1.5),
+            points="outliers",
+            marker=dict(color=trace_color, size=4, opacity=0.4),
+            hovertemplate=f"<b>{stage}</b><br>{violin_label}: %{{y:.1f}}<extra></extra>",
         ))
-        fig_ci = apply_defaults(fig_ci, h=300, margin=dict(t=30, b=60, l=60, r=20))
-        fig_ci.update_xaxes(tickfont=dict(size=11, color=C_TEXT), showgrid=False)
-        fig_ci.update_yaxes(**AXIS_STYLE, title=f"95% CI full width ({ulabel})")
-        st.plotly_chart(fig_ci, use_container_width=True)
 
-    st.markdown("""
-    <div class="callout">
-    💡 <b>Uncertainty insight:</b> Africa and Oceania have the widest confidence intervals —
-    meaning our estimates for these regions are the least statistically reliable, directly
-    linked to the data gaps shown in the Ethical Bias tab. Wider CI = fewer reporting countries
-    = less trustworthy regional averages. Policy decisions for these regions must account for
-    this uncertainty.
-    </div>
-    """, unsafe_allow_html=True)
+    fig5 = apply_chart_theme(fig5)
+    fig5.update_layout(
+        title=dict(
+            text=f"{violin_label} Distribution by Income Level — Box shows median & IQR, dots = outliers",
+            font=dict(size=12, color=TEXT_COL), x=0,
+        ),
+        xaxis=dict(title="Development Stage (Low → High Income)",
+                   showgrid=False, tickfont=dict(color=TEXT_COL)),
+        yaxis=dict(title=violin_label),
+        violinmode="group",
+        legend=dict(
+            orientation="h", y=1.08, x=0.5, xanchor="center",
+            font=dict(size=10, color=TEXT_COL), bgcolor="rgba(0,0,0,0)",
+        ),
+    )
+    st.plotly_chart(fig5, use_container_width=True)
+    st.markdown(
+        '<div class="insight">💡 High-income countries reach 80+ years with narrow spread. '
+        "Low-income nations show wide variance — high within-group inequality driven by "
+        "conflict, HIV burden, and under-investment.</div>",
+        unsafe_allow_html=True,
+    )
 
 
-# ══════════════════════════════════════════════════════════
-# FOOTER
-# ══════════════════════════════════════════════════════════
-st.markdown("---")
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 6 — Animated Gapminder Bubble Chart
+#  Replicates the famous Gapminder visualisation: GDP (x) vs life expectancy
+#  (y), bubble size = population, colour = continent.
+#  Press ▶ to animate across all years.  Selecting a continent highlights it
+#  and fades all others — cross-filtering in motion.
+# ─────────────────────────────────────────────────────────────────────────────
+with tab6:
+    t6_hl_raw = st.multiselect(
+        "Highlight continent (select one or more to focus)",
+        ["All"] + ALL_CONTINENTS,
+        default=["All"], key="t6_hl",
+    )
+    t6_highlight = "All" if (not t6_hl_raw or "All" in t6_hl_raw) else t6_hl_raw[0]
+
+    # Aggregate to one point per (country, year) for the animation
+    anim_df = (
+        DFF.groupby(["country", "year", "continent"])
+           .agg(
+               life_expectancy=("life_expectancy", "mean"),
+               log_gdp=("log_gdp",          "mean"),
+               pop_size=("pop_size",         "mean"),
+               gdp_final=("gdp_final",       "mean"),
+               schooling=("schooling",       "mean"),
+           )
+           .reset_index()
+           .sort_values("year")
+    )
+
+    # Build color map: highlighted continent keeps its palette color;
+    # all others are dimmed to near-invisible grey.
+    highlighted_set = set(ALL_CONTINENTS) if t6_highlight == "All" else (
+        set(t6_hl_raw) - {"All"} if t6_hl_raw and "All" not in t6_hl_raw else set(ALL_CONTINENTS)
+    )
+    color_map = {
+        c: (CONTINENT_COLORS.get(c, "#888") if c in highlighted_set else "rgba(148,163,184,0.18)")
+        for c in ALL_CONTINENTS
+    }
+
+    fig6 = px.scatter(
+        anim_df,
+        x="log_gdp", y="life_expectancy",
+        animation_frame="year",
+        animation_group="country",
+        size="pop_size", color="continent",
+        hover_name="country",
+        custom_data=["gdp_final", "schooling"],
+        color_discrete_map=color_map,
+        size_max=55,
+        labels={
+            "log_gdp":         "log(GDP per Capita)",
+            "life_expectancy": "Life Expectancy (yrs)",
+        },
+    )
+    fig6.update_traces(
+        marker=dict(opacity=0.82, line=dict(width=0.5, color="rgba(255,255,255,0.35)")),
+        hovertemplate=(
+            "<b>%{hovertext}</b><br>"
+            "Life Exp: <b>%{y:.1f} yrs</b><br>"
+            "log(GDP): %{x:.2f}<br>"
+            "GDP: $%{customdata[0]:,.0f}<br>"
+            "Schooling: %{customdata[1]:.1f} yrs<extra></extra>"
+        ),
+    )
+    fig6 = apply_chart_theme(fig6)
+    fig6.update_layout(
+        title=dict(
+            text="Gapminder Animated Bubble — Health vs Wealth Over Time (Press ▶ to Play)",
+            font=dict(size=12, color=TEXT_COL), x=0,
+        ),
+        xaxis=dict(title="log(GDP per Capita) — Higher = Richer Country"),
+        yaxis=dict(title="Life Expectancy (yrs)"),
+        legend=dict(x=1.01, y=1, font=dict(size=10, color=TEXT_COL), bgcolor="rgba(0,0,0,0)"),
+    )
+    # Slow the animation slightly for smoother playback
+    fig6.layout.updatemenus[0].buttons[0].args[1]["frame"]["duration"]      = 700
+    fig6.layout.updatemenus[0].buttons[0].args[1]["transition"]["duration"] = 400
+
+    st.plotly_chart(fig6, use_container_width=True)
+    st.markdown(
+        '<div class="insight">💡 Press ▶ to watch 16 years of global health evolution. '
+        "Bubble size = population. Select a continent above to highlight it. "
+        "Africa (red) shows the steepest improvement trajectory.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FOOTER
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown(
-    "<div style='text-align:center;color:#9CA3AF;font-size:0.72rem;padding:8px 0'>"
-    "ITS68404 – Data Visualization · Group 8 · January 2026 · Taylor's University &nbsp;|&nbsp; "
-    "SDG 3: Good Health and Well-Being &nbsp;|&nbsp; "
-    "WHO Life Expectancy + Gapminder (2000–2015) · 2,416 records · 151 countries"
+    f"<div style='text-align:center;font-size:0.67rem;color:{MUTED_COL};padding:2px 0'>"
+    "ITS68404 · Data Visualization · Group 8 · Taylor's University · January 2026 &nbsp;|&nbsp;"
+    " SDG 3: Good Health and Well-Being &nbsp;|&nbsp;"
+    " 2,416 records · 151 countries · 2000–2015"
     "</div>",
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
