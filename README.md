@@ -188,16 +188,14 @@ Group8-SDG3-Dashboard/
 │   ├── Tab 3: Advanced Analysis          # 3D scatter, parallel coordinates, multi-layer
 │   ├── Tab 4: Scenario Comparison        # Top 10 vs Bottom 10 countries
 │   ├── Tab 5: Geospatial                 # Choropleth map + faceted small multiples
-│   ├── Tab 6: Ethical Bias               # Missing data heatmap + bias visualization
-│   └── Tab 7: Uncertainty                # 95% CI ribbons + uncertainty comparison
-│
+
 ├── ITS68404_Group8_GROUPASGNMT.ipynb
 │   ├── Task 1: Problem Identification    # Stakeholders, SDG alignment
 │   ├── Task 2: Data Engineering          # Loading, cleaning, outlier detection, features
 │   ├── Task 3: EDA (6 viz types)         # Histograms, heatmap, Preston curve, violin, etc.
 │   ├── Task 4: Advanced (7/7 criteria)   # 3D, parallel coords, scenario, bias, uncertainty
 │   ├── Task 5: Reflection & Ethics       # Individual reflections, ethics table
-│   └── Task 6: Summary & Presentation   # Key findings + presentation prep
+
 │
 ├── gapminder_data_graphs.csv             # Gapminder: continent, HDI, GDP, CO2 (3,675 rows)
 ├── Life_Expectancy_Data.csv              # WHO: 22 health indicators (2,938 rows)
@@ -218,8 +216,6 @@ Group8-SDG3-Dashboard/
 | ✅ Interactive Streamlit dashboard | 7 tabs, live sidebar filters, 20+ interactive charts |
 | ✅ Geospatial visualizations | Choropleth world map with year slider across 7 indicators |
 | ✅ Scenario-based comparison | Radar + diverging bars + Top 10 vs Bottom 10 ranked charts |
-| ✅ Ethical bias visualization | Missing data heatmap + bias bar chart by continent & income stage |
-| ✅ Uncertainty visualization | 95% CI ribbon + ±1 SD band per continent, CI width comparison |
 
 ### KPI Cards (Stakeholder-Validated)
 
@@ -264,15 +260,6 @@ After inner join on country + year:
 
 ---
 
-## 👥 Group Members
-
-| # | Name | Student ID | Role |
-|---|------|------------|------|
-| 1 | | | Data Engineering & EDA |
-| 2 | | | Advanced Visualizations |
-| 3 | | | Dashboard & Scenario Comparison |
-| 4 | | | Ethical Bias & Uncertainty |
-| 5 | | | Report Writing & Task 1 |
 
 ---
 
